@@ -13,6 +13,9 @@
 #include "Preventions.hpp"
 #include "Common/Logger.hpp"
 #include "Common/Settings.hpp"
+#include "AntiCheatInitFail.hpp"
+#include "AntiDebug/DebuggerDetections.hpp"
+#include "API/API.hpp"
 
 /*
 	The `AntiCheat` class is a container for the necessary classes of our program, including the monitor, barrier, netclient, and anti-debugger
@@ -21,63 +24,8 @@ class AntiCheat final
 {
 public:
 
-	AntiCheat(Settings* config, WindowsVersion WinVersion) : Config(config), WinVersion(WinVersion)
-	{		
-		if (config == nullptr)
-		{
-			Logger::logf("UltimateAnticheat.log", Err, "Settings pointer was NULL @ AntiCheat::AntiCheat");
-			return;
-		}
-		
-		try
-		{
-			this->NetworkClient = make_shared<NetClient>();
-
-			this->AntiDebugger = make_unique<DebuggerDetections>(config, NetworkClient); //any detection methods need the netclient for comms
-
-			this->Monitor = make_unique<Detections>(config, false, NetworkClient, UnmanagedGlobals::ModulesAtStartup);
-
-			this->Barrier = make_unique<Preventions>(config, true, Monitor.get()->GetIntegrityChecker()); //true = prevent new threads from being made
-		}
-		catch (const std::bad_alloc& e)
-		{
-			Logger::logf("UltimateAnticheat.log", Err, "Critical allocation failure in AntiCheat::AntiCheat: %s", e.what());
-			std::terminate();  //do not allow proceed if any pointers fail to alloc
-		}
-
-		if (config->bUsingDriver) //register + load the driver using the "sc" command, unload it when the program exits
-		{
-			//additionally, we need to check the signature on our driver to make sure someone isn't spoofing it. this will be added soon after initial testing is done
-
-			wchar_t absolutePath[MAX_PATH] = { 0 };
-			
-			if (!GetFullPathName(Config->GetKMDriverPath().c_str(), MAX_PATH, absolutePath, nullptr))
-			{
-				Logger::logf("UltimateAnticheat.log", Err, "Could not get absolute path from driver relative path, shutting down.");
-				std::terminate();  //do not allow proceed since config is set to using driver
-			}
-				
-			if (!Services::LoadDriver(Config->GetKMDriverName().c_str(), absolutePath))
-			{
-				Logger::logf("UltimateAnticheat.log", Err, "Could not get load the driver, shutting down.");
-				std::terminate();  //do not allow to proceed since config is set to using driver
-			}
-
-			Logger::logfw("UltimateAnticheat.log", Info, L"Loaded driver: %s from path %s", Config->GetKMDriverName().c_str(), absolutePath);
-		}
-
-	}
-
-	~AntiCheat() //the destructor is now empty since all pointers of this class were recently switched to unique_ptrs
-	{
-		if (Config != nullptr && Config->bUsingDriver) //unload the KM driver
-		{
-			if (!Services::UnloadDriver(Config->GetKMDriverName()))
-			{
-				Logger::logf("UltimateAnticheat.log", Warning, "Failed to unload kernelmode driver!");
-			}
-		}	
-	}
+	AntiCheat(__in Settings* config, __in const WindowsVersion WinVersion);
+	~AntiCheat();
 
 	AntiCheat& operator=(AntiCheat&& other) = delete; //delete move assignments
 
@@ -88,15 +36,17 @@ public:
 
 	DebuggerDetections* GetAntiDebugger() const { return this->AntiDebugger.get(); }
 	
-	NetClient* GetNetworkClient() const  { return this->NetworkClient.get(); }
+	weak_ptr<NetClient> GetNetworkClient() const  { return this->NetworkClient; }
 	
 	Preventions* GetBarrier() const  { return this->Barrier.get(); }  //pointer lifetime stays within the Anticheat class, these 'Get' functions should only be used to call functions of these classes
 	
 	Detections* GetMonitor() const { return this->Monitor.get(); }
 
-	Settings* GetConfiguration() const { return this->Config; }
+	Settings* GetConfig() const { return this->Config; }
 
-	__forceinline bool IsAnyThreadSuspended();
+	bool IsAnyThreadSuspended();
+
+	bool DoPreInitializeChecks();
 
 private:
 
@@ -111,29 +61,8 @@ private:
 	Settings* Config = nullptr; //the unique_ptr for this is made in main.cpp
 
 	WindowsVersion WinVersion;
+
+	const wstring DriverSignerSubject = L"YourCoolCompany";  //this refers to the company/party who initiated the file signing, for example "Valve Corp.". If you have an EV certificate, you can change this to your own company
+
+	EvidenceLocker* Evidence = nullptr;
 };
-
-/*
-	IsAnyThreadSuspended - Checks the looping threads of class members to ensure the program is running as normal. An attacker may try to suspend threads to either remap or disable functionalities
-	returns true if any thread is found suspended
-*/
-__forceinline bool AntiCheat::IsAnyThreadSuspended()
-{
-	if (Monitor->GetMonitorThread()!= nullptr && Thread::IsThreadSuspended(Monitor->GetMonitorThread()->GetHandle()))
-	{
-		Logger::logf("UltimateAnticheat.log", Detection, "Monitor was found suspended! Abnormal program execution.");
-		return true;
-	}
-	else if (Config->bUseAntiDebugging && Thread::IsThreadSuspended(AntiDebugger->GetDetectionThreadHandle()))
-	{
-		Logger::logf("UltimateAnticheat.log", Detection, "Anti-debugger was found suspended! Abnormal program execution.");
-		return true;
-	}
-	else if (NetworkClient->GetRecvThread() != nullptr && Thread::IsThreadSuspended(NetworkClient->GetRecvThread()->GetHandle()))
-	{
-		Logger::logf("UltimateAnticheat.log", Detection, "Netclient comms thread was found suspended! Abnormal program execution.");
-		return true;
-	}
-
-	return false;
-}

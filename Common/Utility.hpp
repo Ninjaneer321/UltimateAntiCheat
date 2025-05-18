@@ -21,50 +21,23 @@ class Utility final
 {
 public:
 	
-	template<class T>
-	static T ReadPointer(uint64_t ulBase, uint64_t ulOffset)
-	{
-		__try
-		{
-			return *(T*)(*(uint64_t*)ulBase + ulOffset);
-		}
-		__except (1) { return (T)NULL; }
-	}
+	static bool strcmp_insensitive(__in const char* s1, __in const char* s2);
+	static bool wcscmp_insensitive(__in const wchar_t* s1, __in const wchar_t* s2);
 
-	template<class T>
-	static bool WritePointer(uint64_t ulBase, uint64_t ulOffset, T iValue)
-	{
-		__try { *(T*)(*(uint64_t*)ulBase + ulOffset) = iValue; return true; }
-		__except (1) { return false; }
-	}
+	static string GenerateRandomString(__in const int length);
+	static wstring GenerateRandomWString(__in const int length);
 
-	template<class T>
-	static T DereferenceSafe(uint64_t ulAddress)
-	{
-		__try
-		{
-			return *(T*)ulAddress;
-		}
-		__except (1) { return (T)NULL; }
-	}
+	static wstring ConvertStringToWString(__in const std::string& wstr);
+	static string ConvertWStringToString(__in const std::wstring& wstr);
 
-	static bool strcmp_insensitive(const char* s1, const char* s2);
-	static bool wcscmp_insensitive(const wchar_t* s1, const wchar_t* s2);
+	static vector<string> splitStringBySpace(__in char* str);
 
-	static char* GenerateRandomString(int length);
-	static wchar_t* GenerateRandomWString(int length);
+	static void addUniqueString(__inout list<string>& strList, __in const string& str);
+	static bool areAllElementsInList(__in const std::list<std::string>& list1, __in const std::list<std::string>& list2);
 
-	static wstring ConvertStringToWString(const std::string& wstr);
-	static string ConvertWStringToString(const std::wstring& wstr);
+	static void str_to_lower(__inout char* str);
+	static char* strstr_case_insensitive(__in const char* haystack, __in const char* needle);
 
-	static vector<string> splitStringBySpace(char* str);
-
-	static void addUniqueString(list<string>& strList, const string& str);
-	static bool areAllElementsInList(const std::list<std::string>& list1, const std::list<std::string>& list2);
-
-	static void str_to_lower(char* str);
-	static char* strstr_case_insensitive(const char* haystack, const char* needle);
-
-	static wstring ToLower(const std::wstring& str);
-	static bool ContainsWStringInsensitive(const std::wstring& haystack, const std::wstring& needle);
+	static wstring ToLower(__in const std::wstring& str);
+	static bool ContainsWStringInsensitive(__in const std::wstring& haystack, __in const std::wstring& needle);
 };

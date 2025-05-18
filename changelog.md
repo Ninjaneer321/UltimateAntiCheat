@@ -1,4 +1,24 @@
 ## Updates
+- Feb 28, '25: Fix manually mapped image detection, now properly detecting erased PE headers. Further development of any new detection & prevention methods will be ending due to lack of funding; I can no longer give out free work since I can't find any for myself. Any further development of the project will likely switch to being related to design and code cleanliness.  
+
+- Feb 26, '25: Add `ProtectedMemory` class (write protected and resistant to page security modifications via `SEC_NO_CHANGE`) in `AntiTamper/MapProtectedClass.hpp`, make `Settings` class object `ProtectedMemory` to prevent modification of config at runtime, remove `UnmanagedGlobals` namespace, remove `EXPECTED_SECTIONS` define and instead make it fetch at runtime (makes it compatible with any game/number of sections).  
+  
+- Feb 22, '25: Added caching for cert checks of loaded drivers & modules, added revoke checks in `VerifyEmbeddedSignature` and `VerifyCatalogSignature`, removed cache-only for cert checking, added `BOOL checkRevoked` for `HasSignature`. Cleaned up `API::LaunchDefenses`.  
+  
+- Feb 16, '25: Added extra integrity check which checks file on disc's .text section versus the runtime image's.
+  
+- Feb 15, '25: Started Wiki page for documentation, fixed some bugs, and several QoL improvements (thanks LucasParsy for your contributions)
+  
+- Feb 8, '25: Adding manually mapped image checks (not yet detecting erased PE headers, this will come next)
+  
+- Jan 31, '25: Added web-fetching of blacklisted byte patterns at runtime from a url, along with blacklisted/vulnerable driver list
+  
+- Jan 20, '25: Added `.rdata` section hashing, change section hash lists to `map<string, vector<uint64_t>>` for better scaling
+  
+- Jan 4, '25: Happy new year, LLVM/clang-cl compiler support has been added to the branch `llvm-clang`, which uses the LLVM compiler by default (and has a few header changes and code differences). We will work towards being able to obfuscate the project's binary/IR using LLVM transformative passes.  
+
+- Dec 17, '24: Fixed DetectOpenHandlesToProcess to not warn for whitelisted processes
+
 - Nov 28, '24: Added registry key modification notifications via `RegNotifyChangeKeyValue` for some important keys  
 
 - Nov 23, '24: Added signature/byte pattern scanning on newly created processes

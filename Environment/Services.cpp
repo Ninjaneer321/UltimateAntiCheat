@@ -6,6 +6,39 @@
 #endif
 
 /*
+    FetchBlacklistedDrivers - read internet page at `url`, parse each line of the response to add to our blacklisted driver list
+    returns `false` on failure
+*/
+bool Services::FetchBlacklistedDrivers(__in const char* url)
+{
+    if (url == nullptr)
+        return false;
+
+    vector<string> responseHeaders;
+    string response = HttpClient::ReadWebPage(string(url), {}, "", responseHeaders); //fetch blacklisted drivers
+
+    if (response.size() == 0)
+        return false;
+
+    stringstream ss(response);
+
+    string blacklistedDriver;
+
+    while (getline(ss, blacklistedDriver))
+    {
+        if (!blacklistedDriver.empty() && blacklistedDriver.back() == '\r')
+        {
+            blacklistedDriver.pop_back();
+        }
+
+        wstring s = Utility::ConvertStringToWString(blacklistedDriver);
+        BlacklistedDrivers.push_back(s);
+    }
+    
+    return true;
+}
+
+/*
     GetServiceModules - Fills the `DriverPaths` class member variable with a list of drivers loaded on the system
     returns TRUE if the function succeeded
 */
@@ -20,7 +53,7 @@ BOOL Services::GetServiceModules()
 
     if (scmHandle == NULL) 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to open Service Control Manager @ GetServiceModules: %lu\n", GetLastError());
+        Logger::logf(Err, "Failed to open Service Control Manager @ GetServiceModules: %lu\n", GetLastError());
         return FALSE;
     }
 
@@ -28,7 +61,7 @@ BOOL Services::GetServiceModules()
 
     if (!result && GetLastError() != ERROR_MORE_DATA) 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to enumerate services @ GetServiceModules: %lu\n", GetLastError());
+        Logger::logf(Err, "Failed to enumerate services @ GetServiceModules: %lu\n", GetLastError());
         CloseServiceHandle(scmHandle);
         return FALSE;
     }
@@ -37,7 +70,7 @@ BOOL Services::GetServiceModules()
     
     if (services == NULL) 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Memory allocation failed @ GetServiceModules");
+        Logger::logf(Err, "Memory allocation failed @ GetServiceModules");
         CloseServiceHandle(scmHandle);
         return FALSE;
     }
@@ -46,7 +79,7 @@ BOOL Services::GetServiceModules()
 
     if (!result) 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to enumerate services @ GetServiceModules: %lu\n", GetLastError());
+        Logger::logf(Err, "Failed to enumerate services @ GetServiceModules: %lu\n", GetLastError());
         free(services);
         CloseServiceHandle(scmHandle);
         return FALSE;
@@ -95,7 +128,7 @@ BOOL Services::GetLoadedDrivers()
 
     if (!EnumDeviceDrivers((LPVOID*)drivers, sizeof(drivers), &cbNeeded)) 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to enumerate device drivers @ GetLoadedDrivers");
+        Logger::logf(Err, "Failed to enumerate device drivers @ GetLoadedDrivers");
         return FALSE;
     }
 
@@ -108,20 +141,20 @@ BOOL Services::GetLoadedDrivers()
 
         if (GetDeviceDriverBaseName(drivers[i], driverName, MAX_PATH) && GetDeviceDriverFileName(drivers[i], driverPath, MAX_PATH))
         {
-            DriverPaths.push_back(driverPath);
+            this->DriverPaths.push_back(driverPath);
 
             for (wstring blacklisted : this->BlacklistedDrivers) //enumerate blacklisted drivers, check if driverPath contains a blacklisted driver
             {
                 if (Utility::ContainsWStringInsensitive(driverPath, blacklisted))
                 {
-                    Logger::logfw("UltimateAnticheat.log", Detection, L"Found Vulnerable loaded driver @ GetLoadedDrivers: %s", driverPath);
+                    Logger::logfw(Detection, L"Found Vulnerable loaded driver @ GetLoadedDrivers: %s", driverPath);
                     this->FoundBlacklistedDrivers.push_back(driverPath);
                 }
             }
         }
         else 
         {
-            Logger::logf("UltimateAnticheat.log", Err, "Failed to get driver information @ GetLoadedDrivers : error %d\n", GetLastError());
+            Logger::logf(Err, "Failed to get driver information @ GetLoadedDrivers : error %d\n", GetLastError());
             return FALSE;
         }
     }
@@ -130,7 +163,7 @@ BOOL Services::GetLoadedDrivers()
 }
 
 /*
-    GetUnsignedDrivers - returns a list of unsigned driver names loaded on the machine
+    GetUnsignedDrivers - returns a list of unsigned driver names (wstring) loaded on the machine
 */
 list<wstring> Services::GetUnsignedDrivers()
 {
@@ -140,21 +173,114 @@ list<wstring> Services::GetUnsignedDrivers()
     {
         if (!GetLoadedDrivers())
         {
-            Logger::logf("UltimateAnticheat.log", Err, "Failed to get driver list @ GetUnsignedDrivers : error %d\n", GetLastError());
+            Logger::logf(Err, "Failed to get driver list @ GetUnsignedDrivers : error %d\n", GetLastError());
             return unsignedDrivers;
         }
     }
 
-    for (const std::wstring& driverPath : DriverPaths) 
+    const wstring windowsDrive = Services::GetWindowsDriveW();
+
+    for (const std::wstring& driverPath : DriverPaths)
     {
-        if (!Authenticode::HasSignature(driverPath.c_str()))
+        wstring fixedDriverPath;
+        bool foundWhitelisted = false;
+
+        if (driverPath.find(L"\\SystemRoot\\", 0) != wstring::npos) /* replace "\\SystemRoot\\" with "\\??\\<windowsVolume>\\WINDOWS" */
         {
-            Logger::logfw("UltimateAnticheat.log", Detection, L"Found unsigned or outdated certificate on driver: %s\n", driverPath.c_str());
-            unsignedDrivers.push_back(driverPath);
+            fixedDriverPath = L"\\??\\" + windowsDrive + L"WINDOWS\\" + driverPath.substr(12);
         }
         else
         {
-            Logger::logfw("UltimateAnticheat.log", Info, L"Driver is signed: %s\n", driverPath.c_str());
+            fixedDriverPath = driverPath;
+        }
+
+        for (const wstring& whitelisted : WhitelistedUnsignedDrivers)
+        {
+            if (Utility::wcscmp_insensitive(whitelisted.c_str(), driverPath.c_str()) )
+            {
+                foundWhitelisted = true;
+                break;
+            }
+        }
+
+        if (!foundWhitelisted && !Authenticode::HasSignature(fixedDriverPath.c_str(), TRUE))
+        {
+            Logger::logfw(Warning, L"Found unsigned or outdated certificate on driver: %s\n", fixedDriverPath.c_str());
+            unsignedDrivers.push_back(fixedDriverPath);
+        }
+        //else
+        //{
+        //    Logger::logfw(Info, L"Driver is signed: %s\n", fixedDriverPath.c_str()); //commented out to prevent flooding the console & log file
+        //}
+    }
+
+    return unsignedDrivers;
+}
+
+/*
+    GetUnsignedDrivers - returns a list of unsigned driver names (wstring) loaded on the machine
+*/
+list<wstring> Services::GetUnsignedDrivers(__in list<wstring>& cachedVerifiedDriverList)
+{
+    list<wstring> unsignedDrivers;
+
+    if (DriverPaths.size() == 0)
+    {
+        if (!GetLoadedDrivers())
+        {
+            Logger::logf(Err, "Failed to get driver list @ GetUnsignedDrivers : error %d\n", GetLastError());
+            return unsignedDrivers;
+        }
+    }
+
+    const wstring windowsDrive = Services::GetWindowsDriveW();
+
+    for (const std::wstring& driverPath : DriverPaths) //enumerate all loaded drivers
+    {
+        wstring fixedDriverPath;
+
+        bool foundWhitelisted = false;
+
+        if (driverPath.find(L"\\SystemRoot\\", 0) != wstring::npos) /* replace "\\SystemRoot\\" with "\\??\\<windowsVolume>\\WINDOWS" */
+        {
+            fixedDriverPath = L"\\??\\" + windowsDrive + L"WINDOWS\\" + driverPath.substr(12);
+        }
+        else
+        {
+            fixedDriverPath = driverPath;
+        }
+
+        for (const wstring& whitelisted : WhitelistedUnsignedDrivers) //check against whitelisted unsigned list, if so we can skip the cert check
+        {
+            if (Utility::wcscmp_insensitive(whitelisted.c_str(), driverPath.c_str()))
+            {
+                foundWhitelisted = true;
+                break;
+            }
+        }
+
+        for (const wstring& cached : cachedVerifiedDriverList) //check against cached/already verified list, if so we can skip the cert check
+        {
+            if (Utility::wcscmp_insensitive(cached.c_str(), driverPath.c_str()))
+            {
+                foundWhitelisted = true;
+                break;
+            }
+        }
+
+        if (!foundWhitelisted && !Authenticode::HasSignature(fixedDriverPath.c_str(), TRUE))
+        {
+            Logger::logfw(Warning, L"Found unsigned or outdated certificate on driver: %s\n", fixedDriverPath.c_str());
+            unsignedDrivers.push_back(fixedDriverPath);
+        }
+        else
+        {
+            //Logger::logfw(Info, L"Driver is signed: %s\n", fixedDriverPath.c_str()); //commented out to prevent flooding the console & log file
+
+            if (find(cachedVerifiedDriverList.begin(), cachedVerifiedDriverList.end(), fixedDriverPath) == cachedVerifiedDriverList.end()) //signed driver not found in cache, so add it
+            {
+                cachedVerifiedDriverList.push_back(fixedDriverPath); //add to list if not already on it
+            }
         }
     }
 
@@ -162,235 +288,118 @@ list<wstring> Services::GetUnsignedDrivers()
 }
 
 /*
-    IsMachineAllowingSelfSignedDrivers - Opens BCDEdit.exe and pipes output to check if testsigning is enabled. May require running program as administrator.
+    IsMachineAllowingSelfSignedDrivers - uses NtQuerySystemInformationFunc to check if bit in CodeIntegrityOptions is set (CODEINTEGRITY_OPTION_TESTSIGN structure)
     returns TRUE if test signing mode was found.
 */
 BOOL Services::IsTestsigningEnabled()
 {
-    HANDLE hReadPipe, hWritePipe;
-    SECURITY_ATTRIBUTES sa;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    char szOutput[1024];
-    DWORD bytesRead;
-    BOOL foundTestsigning = FALSE;
-
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    string volumeName = GetWindowsDrive();
-
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) //use a pipe to read output of bcdedit command
+    typedef enum _SYSTEM_INFORMATION_CLASS
     {
-        Logger::logf("UltimateAnticheat.log", Err, "CreatePipe failed @ Services::IsMachineAllowingSelfSignedDrivers: %d\n", GetLastError());
-        return foundTestsigning;
-    }
+        SystemCodeIntegrity = 103
+    } SYSTEM_INFORMATION_CLASS;
 
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
+    typedef NTSTATUS(NTAPI* NtQuerySystemInformationFunc)(SYSTEM_INFORMATION_CLASS SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
 
-    string bcdedit_location = "Windows\\System32\\bcdedit.exe";
-    string fullpath_bcdedit = (volumeName.c_str() + bcdedit_location);
-
-    if (!CreateProcessA(fullpath_bcdedit.c_str(), NULL, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    typedef struct _SYSTEM_CODEINTEGRITY_INFORMATION
     {
-        Logger::logf("UltimateAnticheat.log", Err, "CreateProcess failed @ Services::IsMachineAllowingSelfSignedDrivers: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
+        ULONG Length;
+        ULONG CodeIntegrityOptions;
+    } SYSTEM_CODEINTEGRITY_INFORMATION;
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+
+    if (ntdll == NULL)
+    {
+        Logger::logf(Err, "Failed to fetch ntdll module address @ IsMachineAllowingSelfSignedDrivers. Error code : % lu\n", GetLastError());
         return FALSE;
     }
 
-    //..wait for the process to finish
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    NtQuerySystemInformationFunc NtQuerySystemInformation = (NtQuerySystemInformationFunc)GetProcAddress(ntdll, "NtQuerySystemInformation");
 
-    CloseHandle(hWritePipe);
-    CloseHandle(pi.hThread);
-
-    if (!ReadFile(hReadPipe, szOutput, 1024 - 1, &bytesRead, NULL)) //now read our pipe
+    if (!NtQuerySystemInformation)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "ReadFile failed @ Services::IsMachineAllowingSelfSignedDrivers: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        return FALSE;
+        Logger::logf(Err, "Could not get NtQuerySystemInformation function address @ Handles::GetHandles");
+        return {};
     }
 
-    CloseHandle(hReadPipe);
+    SYSTEM_CODEINTEGRITY_INFORMATION sci = { sizeof(sci), 0 };
 
-    szOutput[bytesRead] = '\0';
+    ULONG flags = 0;
+    NTSTATUS status = NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)SystemCodeIntegrity, &sci, sizeof(sci), NULL);
 
-    if (strstr(szOutput, "The boot configuration data store could not be opened") != NULL)
+    if (status == 0)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to run bcdedit @ IsMachineAllowingSelfSignedDrivers. Please make sure program is run as administrator\n");
-        foundTestsigning = FALSE;
+        return (sci.CodeIntegrityOptions & 0x02); //CODEINTEGRITY_OPTION_TESTSIGN
     }
 
-    char* token = strtok(szOutput, "\r\n");
-
-    while (token != NULL)      //Iterate through tokens
-    {
-        if (strstr(token, "testsigning") != NULL && strstr(token, "Yes") != NULL)
-        {
-            foundTestsigning = TRUE;
-        }
-
-        token = strtok(NULL, "\r\n");
-    }
-
-    return foundTestsigning;
+    return FALSE;
 }
 
-
 /*
-    IsDebugModeEnabled - Opens BCDEdit.exe and pipes output to check if debug mode is enabled. May require running program as administrator.
+    IsDebugModeEnabled - checks registry for system start option to check if debug mode is enabled
     returns TRUE if debug  mode is enabled.
 */
 BOOL Services::IsDebugModeEnabled()
 {
-    HANDLE hReadPipe, hWritePipe;
-    SECURITY_ATTRIBUTES sa;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    char szOutput[1024];
-    DWORD bytesRead;
-    BOOL foundKDebugMode = FALSE;
+    HKEY hKey;
+    DWORD dwSize = sizeof(DWORD);
+    DWORD dwValue = 0;
+    const char* registryPath = "SYSTEM\\CurrentControlSet\\Control";
+    const char* valueName = "SystemStartOptions";
+    wchar_t buffer[256];
+    DWORD bufferSize = sizeof(buffer);
+    DWORD type = 0;
 
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, registryPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
 
-    string volumeName = GetWindowsDrive();
+    bool isDebug = false;
 
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) //use a pipe to read output of bcdedit command
+    if (RegQueryValueExA(hKey, valueName, nullptr, &type, reinterpret_cast<LPBYTE>(&buffer), &bufferSize) == ERROR_SUCCESS)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "CreatePipe failed @ Services::IsMachineAllowingSelfSignedDrivers: %d\n", GetLastError());
-        return foundKDebugMode;
-    }
-
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
-
-    string bcdedit_location = "Windows\\System32\\bcdedit.exe";
-    string fullpath_bcdedit = (volumeName + bcdedit_location);
-
-    if (!CreateProcessA(fullpath_bcdedit.c_str(), NULL, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-    {
-        Logger::logf("UltimateAnticheat.log", Err, "CreateProcess failed @ Services::IsDebugModeEnabled: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return foundKDebugMode;
-    }
-
-    //..wait for the process to finish
-    WaitForSingleObject(pi.hProcess, INFINITE);
-
-    CloseHandle(hWritePipe);
-    CloseHandle(pi.hThread);
-
-    if (!ReadFile(hReadPipe, szOutput, 1024 - 1, &bytesRead, NULL)) //now read our pipe
-    {
-        Logger::logf("UltimateAnticheat.log", Err, "ReadFile failed @ Services::IsDebugModeEnabled: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        return foundKDebugMode;
-    }
-
-    CloseHandle(hReadPipe);
-
-    szOutput[bytesRead] = '\0';
-
-    if (strstr(szOutput, "The boot configuration data store could not be opened") != NULL)
-    {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to run bcdedit @ IsMachineAllowingSelfSignedDrivers. Please make sure program is run as administrator\n");
-        foundKDebugMode = FALSE;
-    }
-
-    char* token = strtok(szOutput, "\r\n"); //split based on new line
-
-    while (token != NULL)      //Iterate through tokens, both "yes" and "debug" on same line = debug mode
-    {
-        if (strstr(token, "debug") != NULL && strstr(token, "Yes") != NULL)
+        if (type == REG_SZ)
         {
-            foundKDebugMode = TRUE;
+            std::wstring options(buffer);
+            std::transform(options.begin(), options.end(), options.begin(), ::towlower);
+            isDebug = options.find(L"debug") != std::wstring::npos;
         }
-
-        token = strtok(NULL, "\r\n");
     }
 
-    return foundKDebugMode;
+    RegCloseKey(hKey);
+    return isDebug;
 }
 
 /*
-    IsSecureBootEnabled - checks if secure bool is enabled on machine
+    IsSecureBootEnabled - checks if secure bool is enabled on machine through a powershell cmdlet (`Confirm-SecureBootUEFI`)
+    returns `true` if secure boot is enabled
 */
 BOOL Services::IsSecureBootEnabled()
 {
-    HANDLE hReadPipe, hWritePipe;
-    SECURITY_ATTRIBUTES sa;
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    char szOutput[1024];
-    DWORD bytesRead;
-    BOOL secureBootEnabled = FALSE;
+    HKEY hKey;
+    LONG lResult;
+    DWORD dwSize = sizeof(DWORD);
+    DWORD dwValue = 0;
+    const char* registryPath = "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State";
+    const char* valueName = "UEFISecureBootEnabled";
 
-    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) //use a pipe to read output of bcdedit command
+    lResult = RegOpenKeyExA(HKEY_LOCAL_MACHINE, registryPath, 0, KEY_READ, &hKey);
+    if (lResult != ERROR_SUCCESS)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "CreatePipe failed @ Services::IsSecureBootEnabled: %d\n", GetLastError());
+        Logger::logf(Err, "Error opening registry key:  (%d) @ Services::IsSecureBootEnabled", GetLastError());
         return FALSE;
     }
 
-    memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWritePipe;
+    lResult = RegQueryValueExA(hKey, valueName, NULL, NULL, (LPBYTE)&dwValue, &dwSize);
 
-    if (!CreateProcessA(NULL, (LPSTR)"powershell -c \"Confirm-SecureBootUEFI\"", NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    if (lResult != ERROR_SUCCESS)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "CreateProcess failed @ Services::IsSecureBootEnabled: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
+        Logger::logf(Err, "Error querying registry value: %d @ Services::IsSecureBootEnabled", GetLastError());
+        RegCloseKey(hKey);
         return FALSE;
     }
 
-    //..wait for the process to finish
-    WaitForSingleObject(pi.hProcess, INFINITE);
-
-    CloseHandle(hWritePipe);
-    CloseHandle(pi.hThread);
-
-    if (!ReadFile(hReadPipe, szOutput, 1024 - 1, &bytesRead, NULL)) //now read our pipe
-    {
-        Logger::logf("UltimateAnticheat.log", Err, "ReadFile failed @ Services::IsSecureBootEnabled: %d\n", GetLastError());
-        CloseHandle(hReadPipe);
-        return FALSE;
-    }
-
-    CloseHandle(hReadPipe);
-
-    szOutput[bytesRead] = '\0';
-
-    if (strstr(szOutput, "Cmdlet not supported on this platform") != NULL) //
-    {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to run bcdedit @ IsMachineAllowingSelfSignedDrivers. Please make sure program is run as administrator\n");
-        secureBootEnabled = FALSE;
-    }
-
-    if (strstr(szOutput, "False") != NULL)
-    {
-        secureBootEnabled = FALSE;
-    }
-    else if (strcmp(szOutput, "True") != NULL)
-    {
-        secureBootEnabled = TRUE;
-    }
-
-    return secureBootEnabled;
+    RegCloseKey(hKey);
+    return dwValue;
 }
 
 /*
@@ -404,14 +413,14 @@ string Services::GetWindowsDrive()
     charCount = GetWindowsDirectoryA(volumePath, MAX_PATH);
     if (charCount == 0)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to retrieve Windows directory path @ Services::GetWindowsPath: %d\n", GetLastError());
+        Logger::logf(Err, "Failed to retrieve Windows directory path @ Services::GetWindowsPath: %d\n", GetLastError());
         return "";
     }
 
     CHAR volumeName[MAX_PATH];
     if (!GetVolumePathNameA(volumePath, volumeName, MAX_PATH))
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to retrieve volume path name @ Services::GetWindowsPath: %d\n", GetLastError());
+        Logger::logf(Err, "Failed to retrieve volume path name @ Services::GetWindowsPath: %d\n", GetLastError());
         return "";
     }
 
@@ -429,14 +438,14 @@ wstring Services::GetWindowsDriveW()
     charCount = GetWindowsDirectoryW(volumePath, MAX_PATH);
     if (charCount == 0)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to retrieve Windows directory path @ Services::GetWindowsPathW: %d\n", GetLastError());
+        Logger::logf(Err, "Failed to retrieve Windows directory path @ Services::GetWindowsPathW: %d\n", GetLastError());
         return L"";
     }
 
     wchar_t volumeName[MAX_PATH];
     if (!GetVolumePathNameW(volumePath, volumeName, MAX_PATH))
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Failed to retrieve volume path name @ Services::GetWindowsPathW: %d\n", GetLastError());
+        Logger::logf(Err, "Failed to retrieve volume path name @ Services::GetWindowsPathW: %d\n", GetLastError());
         return L"";
     }
 
@@ -452,6 +461,7 @@ BOOL Services::IsRunningAsAdmin()
     PSID adminGroup = NULL;
 
     SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+
     if (AllocateAndInitializeSid(&NtAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) 
     {
         CheckTokenMembership(NULL, adminGroup, &isAdmin);
@@ -475,7 +485,7 @@ list<DeviceW> Services::GetHardwareDevicesW()
 
     if (deviceInfoSet == INVALID_HANDLE_VALUE) 
     {
-        Logger::logf("UltimateAnticheat.log", Warning, "SetupDiGetClassDevs failed with error: %d @ Services::GetHardwareDevicesW\n", GetLastError());
+        Logger::logf(Warning, "SetupDiGetClassDevs failed with error: %d @ Services::GetHardwareDevicesW", GetLastError());
         return {};
     }
 
@@ -506,58 +516,18 @@ list<DeviceW> Services::GetHardwareDevicesW()
             continue;
         }
 
-        Logger::logfw("UltimateAnticheat.log", Info, L"Found Device: %s\n", d.Description.c_str());
+        Logger::logfw(Info, L"Found Device: %s\n", d.Description.c_str());
         deviceList.push_back(d);
     }
 
     if (GetLastError() != ERROR_NO_MORE_ITEMS)
     {
-        Logger::logf("UltimateAnticheat.log", Warning, "SetupDiEnumDeviceInfo failed with error: %d @ Services::GetHardwareDevicesW\n", GetLastError());
+        Logger::logf(Warning, "SetupDiEnumDeviceInfo failed with error: %d @ Services::GetHardwareDevicesW", GetLastError());
     }
 
     SetupDiDestroyDeviceInfoList(deviceInfoSet); 
 
     return deviceList;
-}
-
-/*
-    Services::IsSecureBootEnabled_RegKey - another method for checking secure boot without using a powershell process
-*/
-BOOL Services::IsSecureBootEnabled_RegKey()
-{
-    HKEY hKey;
-    LONG lResult;
-    DWORD dwSize = sizeof(DWORD);
-    DWORD dwValue = 0;
-    const char* registryPath = "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State"; //optionally xor this
-    const char* valueName = "UEFISecureBootEnabled";
-
-    lResult = RegOpenKeyExA(HKEY_LOCAL_MACHINE, registryPath, 0, KEY_READ, &hKey);
-
-    if (lResult != ERROR_SUCCESS) 
-    {
-        return FALSE;
-    }
-
-    lResult = RegQueryValueExA(hKey, valueName, NULL, NULL, (LPBYTE)&dwValue, &dwSize);
-
-    if (lResult != ERROR_SUCCESS) 
-    {
-        Logger::logf("UltimateAnticheat.log", Warning, "RegCloseKey failed with error: %d @ Services::IsSecureBootEnabled_RegKey\n", lResult);
-        RegCloseKey(hKey);
-        return FALSE;
-    }
-
-    if (dwValue == 1) 
-    {
-        RegCloseKey(hKey);
-        return TRUE;
-    }
-    else 
-    {
-        RegCloseKey(hKey);
-        return FALSE;
-    }
 }
 
 /*
@@ -577,7 +547,7 @@ BOOL Services::CheckUSBDevices()
 
     if (deviceInfoSet == INVALID_HANDLE_VALUE) 
     {
-        //std::cerr << "Failed to get device information set." << std::endl;
+        //Logger::log(Err, "Failed to get device information set.");
         return FALSE;
     }
 
@@ -621,7 +591,7 @@ WindowsVersion Services::GetWindowsVersion()
 
     if (status != 0)
     {
-        Logger::logf("UltimateAnticheat.log", Warning, "Services::GetWindowsMajorVersion failed with error: %x", status);
+        Logger::logf(Warning, "Services::GetWindowsMajorVersion failed with error: %x");
         return ErrorUnknown;
     }
 
@@ -651,7 +621,7 @@ WindowsVersion Services::GetWindowsVersion()
     }
     else if (osVersionInfo.dwMajorVersion == 10 && osVersionInfo.dwMinorVersion == 0)
     {
-        if (osVersionInfo.dwBuildNumber < 22000)
+        if (osVersionInfo.dwBuildNumber < 21996)
         {
             return Windows10;
         }
@@ -668,7 +638,7 @@ WindowsVersion Services::GetWindowsVersion()
     Services::IsHypervisor - returns true if a hypervisor is detected by using the __cpuid intrinsic function
     the 31st bit of ECX indicates a hypervisor
 */
-bool Services::IsHypervisor()
+bool Services::IsHypervisorPresent()
 {
     int cpuInfo[4] = { 0 };
     __cpuid(cpuInfo, 1);
@@ -676,27 +646,54 @@ bool Services::IsHypervisor()
 }
 
 /*
-    Services::GetHypervisorVendor - fetches the hypervisor vendor as `vendor`
+    Services::GetCPUVendor - fetches the CPU vendor
 Additionally, 0x40000001 to 0x400000FF can be queries in the 2nd parameter to __cpuid for more hypervisor-specific info
 */
-void Services::GetHypervisorVendor(__out char vendor[13]) 
+string Services::GetCPUVendor() 
 {
     int cpuInfo[4] = { 0 };
 
-    __cpuid(cpuInfo, 0x40000000); //2nd param is passed to EAX
+    __cpuid(cpuInfo, 0);
 
-    // Copy vendor ID from EBX, ECX, EDX to vendor string
-    ((int*)vendor)[0] = cpuInfo[1];  //BX
-    ((int*)vendor)[1] = cpuInfo[2];  //CX
-    ((int*)vendor)[2] = cpuInfo[3];  //DX
-    vendor[12] = '\0'; 
+    char vendor[13] = { 0 };
+
+    memcpy(vendor, &cpuInfo[1], 4);
+    memcpy(vendor + 4, &cpuInfo[3], 4);
+    memcpy(vendor + 8, &cpuInfo[2], 4);
+
+    return string(vendor);
+}
+
+/*
+  GetHypervisorVendor - check vendor of hypervisor, if present
+  Common results:
+"Microsoft Hv"	Hyper-V
+"KVMKVMKVM"	KVM
+"VMwareVMware"	VMware
+"XenVMMXenVMM"	Xen
+"prl hyperv"	Parallels
+"VBoxVBoxVBox"	VirtualBox
+*/
+string Services::GetHypervisorVendor()
+{
+    int cpuInfo[4] = { 0 };
+
+    __cpuid(cpuInfo, 0x40000000);
+
+    char vendor[13] = { 0 };
+
+    memcpy(vendor, &cpuInfo[1], 4);
+    memcpy(vendor + 4, &cpuInfo[2], 4);
+    memcpy(vendor + 8, &cpuInfo[3], 4);
+
+    return string(vendor);
 }
 
 /*
     Services::LoadDriver - register a service and load a driver given a driverName and driverPath using SCM
     return `true` on success
 */
-bool Services::LoadDriver(const std::wstring& driverName, const std::wstring& driverPath)
+bool Services::LoadDriver(__in const std::wstring& serviceName, __in const std::wstring& driverPath)
 {
     SC_HANDLE hSCManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
 
@@ -704,14 +701,14 @@ bool Services::LoadDriver(const std::wstring& driverName, const std::wstring& dr
 
     if (!hSCManager)
     {
-        Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to open SCM: %d", GetLastError());
+        Logger::logfw(Warning, L"Failed to open SCM: %d", GetLastError());
         return false;
     }
 
     SC_HANDLE hService = CreateService(      //create driver service
         hSCManager,
-        driverName.c_str(),
-        driverName.c_str(),
+        serviceName.c_str(),
+        serviceName.c_str(),
         SERVICE_START | DELETE | SERVICE_STOP,
         SERVICE_KERNEL_DRIVER,
         SERVICE_DEMAND_START,
@@ -723,11 +720,11 @@ bool Services::LoadDriver(const std::wstring& driverName, const std::wstring& dr
     {
         if (GetLastError() == ERROR_SERVICE_EXISTS)
         {
-            hService = OpenService(hSCManager, driverName.c_str(), SERVICE_START);
+            hService = OpenService(hSCManager, serviceName.c_str(), SERVICE_START);
         }
         else
         {
-            Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to create service:  %d", GetLastError());
+            Logger::logfw(Warning, L"Failed to create service:  %d", GetLastError());
             CloseServiceHandle(hSCManager);
             return false;
         }
@@ -737,13 +734,13 @@ bool Services::LoadDriver(const std::wstring& driverName, const std::wstring& dr
     {
         if (GetLastError() != ERROR_SERVICE_ALREADY_RUNNING)
         {
-            Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to start service: %d", GetLastError());
+            Logger::logfw(Warning, L"Failed to start service: %d", GetLastError());
             loadSuccess = false;
         }
     }
 
     if(loadSuccess)
-        Logger::logfw("UltimateAnticheat.log", Info, L"Driver %s loaded successfully.", driverName.c_str());
+        Logger::logfw(Info, L"Driver %s loaded successfully.", serviceName.c_str());
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
@@ -754,7 +751,7 @@ bool Services::LoadDriver(const std::wstring& driverName, const std::wstring& dr
     Services::UnloadDriver - unregister the driver service and unload a driver given a driverName and driverPath using SCM
     return `true` on success
 */
-bool Services::UnloadDriver(const std::wstring& driverName)
+bool Services::UnloadDriver(__in const std::wstring& serviceName)
 {
     SC_HANDLE hSCManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
 
@@ -762,15 +759,15 @@ bool Services::UnloadDriver(const std::wstring& driverName)
 
     if (!hSCManager)
     {
-        Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to open SCM: %d", GetLastError());
+        Logger::logfw(Warning, L"Failed to open SCM: %d", GetLastError());
         return false;
     }
 
-    SC_HANDLE hService = OpenService(hSCManager, driverName.c_str(), SERVICE_STOP | DELETE);
+    SC_HANDLE hService = OpenService(hSCManager, serviceName.c_str(), SERVICE_STOP | DELETE);
 
     if (!hService)
     {
-        Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to open driver service: %d", GetLastError());
+        Logger::logfw(Warning, L"Failed to open driver service: %d", GetLastError());
         CloseServiceHandle(hSCManager);
         return false;
     }
@@ -779,24 +776,176 @@ bool Services::UnloadDriver(const std::wstring& driverName)
 
     if (ControlService(hService, SERVICE_CONTROL_STOP, &status))     //stop driver
     {
-        Logger::logfw("UltimateAnticheat.log", Info, L"Driver stopped successfully.");
+        Logger::logfw(Info, L"Driver stopped successfully.");
     }
     else if (GetLastError() != ERROR_SERVICE_NOT_ACTIVE)
     {
-        Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to stop driver service: %d", GetLastError()); //don't return false yet incase the service was already stopped, in that case delete it
+        Logger::logfw(Warning, L"Failed to stop driver service: %d", GetLastError()); //don't return false yet incase the service was already stopped, in that case delete it
         unloadSuccess = false;
     }
 
     if (!DeleteService(hService))     //delete service
     {
-        Logger::logfw("UltimateAnticheat.log", Warning, L"Failed to delete driver service: %d", GetLastError());
+        Logger::logfw(Warning, L"Failed to delete driver service: %d", GetLastError());
         unloadSuccess = false;
     }
 
     if(unloadSuccess)
-        Logger::logfw("UltimateAnticheat.log", Info, L"Driver %s unloaded successfully.", driverName.c_str());
+        Logger::logfw(Info, L"Driver %s unloaded successfully.", serviceName.c_str());
 
     CloseServiceHandle(hService);
     CloseServiceHandle(hSCManager);
     return unloadSuccess;
+}
+
+
+/*
+    EnumerateProcesses - return list of running processes ids
+*/
+list<DWORD> Services::EnumerateProcesses()
+{
+    list<DWORD> procs;
+
+    PROCESSENTRY32 entry;
+    entry.dwSize = sizeof(PROCESSENTRY32);
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+
+    if (Process32First(snapshot, &entry) == TRUE)
+    {
+        while (Process32Next(snapshot, &entry) == TRUE)
+        {
+            procs.push_back(entry.th32ProcessID);
+        }
+    }
+
+    CloseHandle(snapshot);
+    return procs;
+}
+
+/*
+    GetProcessDirectoryW - return directory of process `pid`
+*/
+std::string Services::GetProcessDirectory(__in const DWORD pid)
+{
+    if (pid <= 4)
+        return "";
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (hProcess == nullptr)
+    {
+        Logger::logf(Err, "Failed to open process with PID %d @ GetProcessDirectory", pid);
+        return "";
+    }
+
+    char imagePath[MAX_PATH];
+    DWORD size = MAX_PATH;
+
+    if (QueryFullProcessImageNameA(hProcess, 0, imagePath, &size))
+    {
+        char* lastSlash = strrchr(imagePath, '\\');
+        if (lastSlash != nullptr)
+        {
+            *lastSlash = '\0';
+            CloseHandle(hProcess);
+	    strcat(imagePath, "\\");
+            return std::string(imagePath);
+        }
+        else
+        {
+            Logger::logf(Err, "Failed to find directory in the image path (pid %d) @ GetProcessDirectory", pid);
+        }
+    }
+    else
+    {
+        Logger::logf(Err, "Failed to query process image name with pid %d @ GetProcessDirectory", pid);
+    }
+
+    CloseHandle(hProcess);
+    return "";
+}
+
+/*
+    GetProcessDirectoryW - return directory of process `pid`
+*/
+wstring Services::GetProcessDirectoryW(__in const DWORD pid)
+{
+    if (pid <= 4)
+        return L"";
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+
+    if (hProcess == nullptr)
+    {
+        Logger::logf(Err, "Failed to open process with PID %d @ GetProcessDirectory", pid);
+        return L"";
+    }
+
+    wchar_t imagePath[MAX_PATH];
+    DWORD size = MAX_PATH;
+
+    if (QueryFullProcessImageNameW(hProcess, 0, imagePath, &size))
+    {
+        wchar_t* lastSlash = wcsrchr(imagePath, L'\\'); //get last occurance of \\ as a ptr
+
+        if (lastSlash != nullptr)
+        {
+            *lastSlash = '\0';
+
+            CloseHandle(hProcess);
+            wcscat(imagePath, L"\\");
+            return std::wstring(imagePath);
+        }
+        else
+        {
+            Logger::logf(Err, "Failed to find directory in the image path (pid %d) @ GetProcessDirectory", pid);
+        }
+    }
+    else
+    {
+        Logger::logf(Err, "Failed to query process image name with pid %d @ GetProcessDirectory", pid);
+    }
+
+
+    CloseHandle(hProcess);
+    return L"";
+}
+
+bool Services::IsDriverRunning(__in const std::wstring& serviceName)
+{
+    if (serviceName.size() == 0)
+        return false;
+
+    SC_HANDLE hSCManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_ENUMERATE_SERVICE);
+
+    if (!hSCManager)
+    {
+        Logger::logfw(Warning, L"Failed to open SCM: %d", GetLastError());
+        return false;
+    }
+
+    //open driver service
+    SC_HANDLE hService = OpenService(hSCManager, serviceName.c_str(), SERVICE_QUERY_STATUS);
+
+    if (!hService)
+    {
+        Logger::logfw(Warning, L"Failed to open service %s: %d", serviceName.c_str(), GetLastError());
+        CloseServiceHandle(hSCManager);
+        return false;
+    }
+
+    SERVICE_STATUS status;
+
+    if (!QueryServiceStatus(hService, &status))     //query the service status
+    {
+        Logger::logfw(Warning, L"Failed to query service status: %d", GetLastError());
+        CloseServiceHandle(hService);
+        CloseServiceHandle(hSCManager);
+        return false;
+    }
+
+    CloseServiceHandle(hService);
+    CloseServiceHandle(hSCManager);
+
+    return (status.dwCurrentState == SERVICE_RUNNING);
 }

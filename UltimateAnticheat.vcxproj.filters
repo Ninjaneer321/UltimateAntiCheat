@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -108,6 +108,15 @@
     <ClCompile Include="Common\Logger.cpp">
       <Filter>Common</Filter>
     </ClCompile>
+    <ClCompile Include="Network\HttpClient.cpp">
+      <Filter>Network</Filter>
+    </ClCompile>
+    <ClCompile Include="AntiCheat.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="EvidenceLocker.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AntiCheat.hpp">
@@ -173,9 +182,6 @@
     <ClInclude Include="Process\Thread.hpp">
       <Filter>Process</Filter>
     </ClInclude>
-    <ClInclude Include="Common\Globals.hpp">
-      <Filter>Common</Filter>
-    </ClInclude>
     <ClInclude Include="Network\Packets\PacketReader.hpp">
       <Filter>Network\Packets</Filter>
     </ClInclude>
@@ -200,10 +206,39 @@
     <ClInclude Include="AntiDebug\DebuggerDetections.hpp">
       <Filter>AntiDebug</Filter>
     </ClInclude>
+    <ClInclude Include="Network\HttpClient.hpp">
+      <Filter>Network</Filter>
+    </ClInclude>
+    <ClInclude Include="AntiCheatInitFail.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\DetectionFlags.hpp">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="AntiTamper\MapProtectedClass.hpp">
+      <Filter>AntiTamper</Filter>
+    </ClInclude>
+    <ClInclude Include="EvidenceLocker.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Obscure\XorStr.hpp">
+      <Filter>Obscure</Filter>
+    </ClInclude>
+    <ClInclude Include="Obscure\VirtualMachine.hpp">
+      <Filter>Obscure</Filter>
+    </ClInclude>
+    <ClInclude Include="Obscure\VirtualMachineException.hpp">
+      <Filter>Obscure</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="UltimateAnticheat.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="Obscure\ASMStubs.asm">
+      <Filter>Obscure</Filter>
+    </MASM>
   </ItemGroup>
 </Project>

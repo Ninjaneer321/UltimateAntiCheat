@@ -1,30 +1,34 @@
 //By AlSch092 @ Github
 #pragma once
 #include <windows.h>
+#include <chrono>
+#include <thread>
 #include "../Common/Logger.hpp"
 
 /*
-	Thread class represents a process thread, we aim to track threads in our process such that we can determine possible rogue threads
-	Any helper functions related to threads are also defined in this class
+	The `Thread` class is a RAII wrapper around std::thread, providing additional functionality for thread management
 */
-class Thread final
+class Thread
 {
 public:
 
+	/*  A Thread constructor with only a thread id implies the thread was spawned by some other mechanism than our own code, and we'd like to keep track of it
+	*/
 	Thread(DWORD id) : Id(id) //Thread classes that call this constructor are ones we aren't creating ourselves to execute code, and rather ones collected in the TLS callback for bookkeeping purposes
 	{
 		this->ShutdownSignalled = false;
 		this->ShouldRunForever = false;
 	}
 
-	Thread(LPTHREAD_START_ROUTINE toExecute, LPVOID lpOptionalParam, BOOL shouldRunForever) : ExecutionAddress((UINT_PTR)toExecute), OptionalParam(lpOptionalParam), ShouldRunForever(shouldRunForever)
+	/* A Thread constructor with enough information to launch a new thread will do so
+	*/
+	Thread(LPTHREAD_START_ROUTINE toExecute, LPVOID lpOptionalParam, bool shouldRunForever, bool shouldDetach) : ExecutionAddress((UINT_PTR)toExecute), OptionalParam(lpOptionalParam), ShouldRunForever(shouldRunForever), isDetached(shouldDetach)
 	{
-		this->handle = CreateThread(0, 0, toExecute, lpOptionalParam, 0, &this->Id);
-
-		if (this->handle == INVALID_HANDLE_VALUE)
+		if (!BeginExecution(toExecute, lpOptionalParam, shouldRunForever, shouldDetach))
 		{
-			Logger::logf("UltimateAnticheat.log", Err, "Failed to create new thread @ Thread::Thread - address %llX", (UINT_PTR)toExecute);
-			return;
+			Logger::logf(Err, "Thread which was scheduled to execute at: %llX failed to spawn", this->ExecutionAddress);
+
+			//std::terminate();  //Optionally, terminate the program since a scheduled thread could not start properly. Integrity cannot be guaranteed if one or more threads fails
 		}
 
 		this->ShutdownSignalled = false;
@@ -32,15 +36,30 @@ public:
 
 	~Thread()
 	{
-		Logger::logf("UltimateAnticheat.log", Info, "Ending thread which originally executed at: %llX", this->ExecutionAddress);
+		Logger::logf(Info, "Ending thread which originally executed at: %llX", this->ExecutionAddress);
 
-		if (this->handle != INVALID_HANDLE_VALUE)
+		if (this->t.joinable())
 		{
 			this->ShutdownSignalled = true;
 
-			if (!TerminateThread(this->handle, 0))
+			auto start = std::chrono::high_resolution_clock::now(); //timeout timer
+
+			while (this->t.joinable())
 			{
-				Logger::logf("UltimateAnticheat.log", Warning, "TerminateThread failed @ ~Thread");
+
+				if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::high_resolution_clock::now() - start).count() >= 10)  // If 10 seconds have passed, exit the loop
+				{
+					Logger::logf(Warning, "Thread did not finish execution within the timeout period.");
+					break;
+				}
+
+				// Allow the thread some time to finish by sleeping for a short period (you could adjust this as needed)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+
+			if (this->t.joinable())
+			{
+				this->t.join();  //wait for the thread to finish if still running
 			}
 		}
 	}
@@ -57,28 +76,38 @@ public:
 	Thread operator/(Thread&) = delete;
 
 	static bool IsThreadRunning(HANDLE threadHandle); //these could potentially go into Process.hpp/cpp, since we have one Thread class for each thread, thus a static function is not as well suited to be here
-	static bool IsThreadSuspended(HANDLE threadHandle);
+	static bool IsThreadSuspended(DWORD tid);
+
+	void JoinThread() { if(t.joinable()) t.join(); } //since the copy assignment is deleted in std::thread we can't do std::thread getThreadObject() 
 
 	HANDLE GetHandle() const { return this->handle; }
 	DWORD GetId() const { return this->Id; }
+	auto GetTick() const { return this->Tick; }
 	DWORD_PTR GetExecutionAddress() const { return this->ExecutionAddress; }
 	LPVOID GetOptionalParameter() const { return this->OptionalParam; }
 
-	BOOL RunsForever() const { return this->ShouldRunForever; }
-	BOOL IsShutdownSignalled() const { return this->ShutdownSignalled; }
+	bool RunsForever() const { return this->ShouldRunForever; }
+	bool IsShutdownSignalled() const { return this->ShutdownSignalled; }
+
 	void SignalShutdown(BOOL toShutdown) { this->ShutdownSignalled = toShutdown; }
 
-	BOOL BeginExecution();
-	BOOL BeginExecution(DWORD_PTR toExecute, LPVOID lpOptionalParam, BOOL shouldRunForever);
+	bool BeginExecution(LPTHREAD_START_ROUTINE toExecute, LPVOID lpOptionalParam, bool shouldRunForever, bool shouldDetach);
+
+	void UpdateTick() { this->Tick = std::chrono::steady_clock::now(); }
 
 private:
 
-	HANDLE handle = INVALID_HANDLE_VALUE;
-	DWORD Id = 0; //thread id
+	std::thread t;
+
+	HANDLE handle = INVALID_HANDLE_VALUE; //assigned to in `BeginExecution`
+	DWORD Id = 0; //thread id, assigned to in `BeginExecution` or class constructor
 
 	DWORD_PTR ExecutionAddress = 0;
 	LPVOID OptionalParam = nullptr;
 
-	BOOL ShouldRunForever;
-	BOOL ShutdownSignalled;
+	bool isDetached = false;
+	bool ShouldRunForever = true;
+	std::atomic<bool> ShutdownSignalled;
+
+	std::chrono::steady_clock::time_point Tick; //can be used in cross checks to ensure thread is running as expected. should be updated by the owning thread during execution loops
 };

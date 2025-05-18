@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string>
 #include <intrin.h>
+#include <mutex>
 
 #include "../Common/Error.hpp"
 #include "../Common/DetectionFlags.hpp"
@@ -39,12 +40,12 @@ public:
 	{
 		if (serverEndpoint == nullptr)
 		{
-			Logger::logf("UltimateAnticheat.log", Warning, "serverEndpoint was nullptr at NetClient::NetClient!");
+			Logger::logf(Warning, "serverEndpoint was nullptr at NetClient::NetClient!");
 		}
 
 		if (port == 0)
 		{
-			Logger::logf("UltimateAnticheat.log", Warning, "Port was 0 at NetClient::NetClient!");
+			Logger::logf(Warning, "Port was 0 at NetClient::NetClient!");
 		}
 
 		if(serverEndpoint != nullptr)
@@ -75,13 +76,14 @@ public:
 
 	static void ProcessRequests(LPVOID Param); //calls recv in a loop to handle requests, and if this routine is not running the program should be exited
 
-	Error Initialize(string ip, uint16_t port, string gameCode); //connects, sends CS_HELLO, verifies the response of a version number from server
-	Error EndConnection(int reason); //sends CS_GOODBYE and disconnects the socket
-	Error SendData(PacketWriter* outPacket); //all data sent to the server should go through this
+	Error Initialize(__in const std::string ip, __in const uint16_t port, __in const  std::string gameCode); //connects, sends CS_HELLO, verifies the response of a version number from server
+	Error EndConnection(__in const int reason); //sends CS_GOODBYE and disconnects the socket
+	Error SendData(__in PacketWriter* outPacket); //all data sent to the server should go through this
 
-	Error FlagCheater(DetectionFlags flag);
-	Error QueryMemory(uint64_t address, uint32_t size); //query specific memory address, send its bytes values back to server
-	__forceinline const char*  MakeHeartbeat(string cookie);
+	Error FlagCheater(__in const DetectionFlags flag);
+	Error FlagCheater(__in const DetectionFlags flag, __in const std::string data, __in const DWORD pid);
+	Error QueryMemory(__in const uint64_t address, __in const  uint32_t size); //query specific memory address, send its bytes values back to server
+	__forceinline const char*  MakeHeartbeat(__in const std::string cookie);
 
 	static string GetHostname();
 	string GetMACAddress();
@@ -97,7 +99,7 @@ public:
 	uint16_t GetConnectedPort() const { return this->Port; }
 	Thread* GetRecvThread() const { return this->RecvLoopThread; }
 
-	void CipherData(LPBYTE buffer, int length); //encrypt in/out data 
+	void __forceinline CipherData(__inout LPBYTE buffer, __in const int length); //encrypt in/out data 
 
 private:
 
@@ -121,5 +123,8 @@ private:
 
 	Thread* RecvLoopThread = NULL;
 	DWORD recvThreadId = 0;
+
+	mutex SendPacketMutex;
+	mutex RecvPacketMutex;
 };
 

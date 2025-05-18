@@ -1,44 +1,45 @@
 //By AlSch092 @ Github
 #include "Thread.hpp"
 
-BOOL Thread::BeginExecution()
+/*
+    Thread::BeginExecution - Managed thread creation & start
+    return `true` on success, `false` on failure
+*/
+bool Thread::BeginExecution(LPTHREAD_START_ROUTINE toExecute, LPVOID lpOptionalParam, bool shouldRunForever, bool shouldDetach)
 {
-	if (ExecutionAddress != NULL)
-	{
-		this->handle = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)&ExecutionAddress, OptionalParam, 0, &this->Id);
+    if (toExecute != NULL)
+    {
+        this->ExecutionAddress = (DWORD_PTR)toExecute;
+        this->OptionalParam = lpOptionalParam;
+        this->ShouldRunForever = shouldRunForever;
 
-		if (this->handle == INVALID_HANDLE_VALUE)
-		{
-			this->Id = NULL;
-			return FALSE;
-		}
-	}
+        try
+        {
+            // Use a lambda to wrap the LPTHREAD_START_ROUTINE for std::thread
+            this->t = std::thread([toExecute, lpOptionalParam]() { toExecute(lpOptionalParam); });
 
-	return TRUE;
+            this->handle = t.native_handle(); // Get the native handle
+            this->Id = GetThreadId(this->handle); //the std::thread's id won't be the same as windows thread ids, so use the native handle to get the tid which we can use with winapi
+
+            if (shouldDetach)
+                t.detach();
+
+            Tick = std::chrono::steady_clock::now();
+
+            return true;
+        }
+        catch (const std::system_error& e)
+        {
+            Logger::logf(Err, "std::thread failed @ BeginExecution: %s\n", e.what());
+            this->Id = NULL;
+            return false;
+        }
+    }
+    else
+    {
+        return false;
+    }
 }
-
-BOOL Thread::BeginExecution(DWORD_PTR toExecute, LPVOID lpOptionalParam, BOOL shouldRunForever)
-{
-	if (ExecutionAddress != NULL)
-	{
-		this->ExecutionAddress = toExecute;
-		this->OptionalParam = lpOptionalParam;
-		this->ShouldRunForever = shouldRunForever;
-
-		this->handle = CreateThread(0, 0, (LPTHREAD_START_ROUTINE)&ExecutionAddress, OptionalParam, 0, &this->Id);
-
-		if (this->handle == INVALID_HANDLE_VALUE)
-		{
-			this->Id = NULL;
-			return FALSE;
-		}
-
-		return TRUE;
-	}
-	else
-		return FALSE;
-}
-
 bool Thread::IsThreadRunning(HANDLE threadHandle)
 {
     if (threadHandle == NULL)
@@ -51,30 +52,49 @@ bool Thread::IsThreadRunning(HANDLE threadHandle)
         return (exitCode == STILL_ACTIVE);
     }
 
-    Logger::logf("UltimateAnticheat.log", Err, " GetExitCodeThread failed @ IsThreadRunning: %d\n", GetLastError());
+    Logger::logf(Err, " GetExitCodeThread failed @ IsThreadRunning: %d\n", GetLastError());
     return false;
 }
 
 /*
-    IsThreadSuspended - checks if a thread is suspending it by attempting to suspend it
-    has its drawbacks since it suspends threads, but it works fine
+    IsThreadSuspended - checks if a thread is currently suspended by suspending it
+    has its drawbacks since it suspends threads very briefly, but it works fine
 */
-bool Thread::IsThreadSuspended(HANDLE threadHandle)
+bool Thread::IsThreadSuspended(DWORD tid)
 {
-    DWORD suspendCount = SuspendThread(threadHandle); //OS handles suspend count so we can't fetch this from memory in the current process
+    if (tid == 0)
+        return false;
+
+    bool suspended = false;
+    DWORD suspendCount = 0;
+
+    HANDLE threadHandle = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+
+    if (threadHandle == INVALID_HANDLE_VALUE || threadHandle == 0)
+        return false;
+
+    __try
+    {
+        suspendCount = SuspendThread(threadHandle); //warning: invalid handle will throw exception here
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
 
     if (suspendCount == (DWORD)-1)
     {
         return false;
     }
-    else if (suspendCount > 0)
+    else if (suspendCount > 0) //already suspended by someone else
     {
         ResumeThread(threadHandle);
-        return true;
+        suspended = true;
     }
     else
     {
         ResumeThread(threadHandle);
-        return false;
-    }  
+    }
+
+    return suspended;
 }

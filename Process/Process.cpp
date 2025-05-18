@@ -1,74 +1,50 @@
 #include "Process.hpp"
 
-/*
-    GetMemorySize - retrieves memory size of current process module
-    returns the size of current process module or 0 if the function fails.
-*/
-uint32_t Process::GetMemorySize() //returns uint32_t value of combined byte size of all mem regions of the process
-{
-    DWORD dOldProt = 0;
-    HANDLE hModuleSnap = INVALID_HANDLE_VALUE;
-    MODULEENTRY32 moduleEntry;
+int Process::NumSections = 0; //we need to store the real number of sections, since we're spoofing it at runtime
+wstring Process::ExecutableModuleNameW = wstring(_MAIN_MODULE_NAME_W); //store the name of the executable module, since we're modifying the module name at runtime
 
-    hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-    if (hModuleSnap == INVALID_HANDLE_VALUE)
-        return false;
-
-    moduleEntry.dwSize = sizeof(MODULEENTRY32);
-
-    if (!Module32First(hModuleSnap, &moduleEntry))
-    {
-        CloseHandle(hModuleSnap);
-        return 0;
-    }
-
-    UINT_PTR ulBaseAddress = reinterpret_cast<UINT_PTR>(moduleEntry.modBaseAddr);
-    UINT_PTR ulBaseSize = moduleEntry.modBaseSize;
-
-    return (uint32_t)ulBaseSize;
-}
 /*
     CheckParentProcess - checks if the parent process is the process name `desiredParent`
     returns TRUE if our parameter desiredParent is the same process name as our parent process ID
 */
-BOOL Process::CheckParentProcess(wstring desiredParent)
+BOOL Process::CheckParentProcess(__in const wstring desiredParent, __in const bool bShouldCheckSignature)
 {
-    if (GetParentProcessId() == GetProcessIdByName(desiredParent))
-        return true;
+    std::list<DWORD> pids = GetProcessIdsByName(desiredParent);
+    DWORD parentPid = GetParentProcessId();
     
-    return false;
-}
-
-/*
-   IsProcessElevated - Check if we are running as administrator
-   returns TRUE if the current process is elevated
-*/
-BOOL Process::IsProcessElevated() 
-{
-    auto fRet = FALSE;
-    auto hToken = (HANDLE)NULL;
-
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) 
+    if (bShouldCheckSignature)
     {
-        TOKEN_ELEVATION Elevation;
-        DWORD cbSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &Elevation, sizeof(Elevation), &cbSize)) {
-            fRet = Elevation.TokenIsElevated;
+        BOOL bFoundValidSignature = FALSE;
+
+        for (DWORD pid : pids)
+        {
+            if (parentPid == pid)
+            {
+                wstring fullPath = Services::GetProcessDirectoryW(pid); //get path of `pid` for cert checking
+                fullPath += desiredParent;
+
+                if (Authenticode::HasSignature(fullPath.c_str(), TRUE))
+                {
+                    bFoundValidSignature = TRUE;
+                    break;
+                }
+            }
         }
-    }
-    if (hToken) 
-    {
-        CloseHandle(hToken);
-    }
 
-    return fRet;
+		if (!bFoundValidSignature)
+			Logger::logf(Err, "Parent process %s does not have a valid signature", desiredParent.c_str());
+
+		return bFoundValidSignature;
+    }
+    else
+        return (std::find(std::begin(pids), std::end(pids), parentPid) != std::end(pids));
 }
 
 /*
     HasExportedFunction checks a loaded module if it's exported `functionName`. Useful for anti-VEH debuggers, since these generally inject themselves into the process and export initialization routines
     returns   true if `dllName` has `functionName` exported.
 */
-bool Process::HasExportedFunction(string dllName, string functionName)
+bool Process::HasExportedFunction(__in const string dllName, __in const  string functionName)
 {
     DWORD* dNameRVAs(0); //addresses of export names
     _IMAGE_EXPORT_DIRECTORY* ImageExportDirectory;
@@ -97,12 +73,12 @@ bool Process::HasExportedFunction(string dllName, string functionName)
             }
         }
         else
-            Logger::log("UltimateAnticheat.log", Err, " ImageExportDirectory was NULL @ Process::HasExportedFunction");
+            Logger::log(Err, " ImageExportDirectory was NULL @ Process::HasExportedFunction");
         
         UnMapAndLoad(&LoadedImage);
     }
     else
-        Logger::logf("UltimateAnticheat.log", Err, "MapAndLoad failed: %d @ Process::HasExportedFunction \n", GetLastError());
+        Logger::logf(Err, "MapAndLoad failed: %d @ Process::HasExportedFunction \n", GetLastError());
     
 
     return bFound;
@@ -112,9 +88,9 @@ bool Process::HasExportedFunction(string dllName, string functionName)
     GetSections - gathers a list of ProcessData::Section* from the current process
     returns list<ProcessData::Section*>*, and an empty list if the routine fails
 */
-list<ProcessData::Section*>* Process::GetSections(string module)
+list<ProcessData::Section*> Process::GetSections(__in const string module)
 {
-    list<ProcessData::Section*>* Sections = new list<ProcessData::Section*>();
+    list<ProcessData::Section*> Sections;
 
     PIMAGE_SECTION_HEADER sectionHeader;
     HINSTANCE hInst = NULL;  
@@ -127,21 +103,29 @@ list<ProcessData::Section*>* Process::GetSections(string module)
 
     if (pDoH == NULL || hInst == NULL)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " PIMAGE_DOS_HEADER or hInst was NULL at Process::GetSections\n");
+        Logger::logf(Err, " PIMAGE_DOS_HEADER or hInst was NULL at Process::GetSections\n");
         return Sections;
     }
 
     pNtH = (PIMAGE_NT_HEADERS64)((PIMAGE_NT_HEADERS64)((PBYTE)hInst + (DWORD)pDoH->e_lfanew));
     sectionHeader = IMAGE_FIRST_SECTION(pNtH);
 
-    for (int i = 0; i < EXPECTED_SECTIONS; i++)
+    int nSections = Process::GetNumSections();
+
+    if (nSections == 0)
+        nSections = pNtH->FileHeader.NumberOfSections;
+
+    for (int i = 0; i < nSections; i++)
     {
         ProcessData::Section* s = new ProcessData::Section();
 
         s->address = sectionHeader[i].VirtualAddress;
 
-        strcpy_s(s->name, (const char*)sectionHeader[i].Name);
- 
+        s->name = std::string(reinterpret_cast<const char*>(sectionHeader[i].Name));
+      
+        if (s->name.size() > 8)
+            s->name.resize(9);
+
         s->Misc.VirtualSize = sectionHeader[i].Misc.VirtualSize;
         s->size = s->Misc.VirtualSize;
         s->PointerToRawData = sectionHeader[i].PointerToRawData;
@@ -149,7 +133,7 @@ list<ProcessData::Section*>* Process::GetSections(string module)
         s->NumberOfLinenumbers = sectionHeader[i].NumberOfLinenumbers;
         s->PointerToLinenumbers = sectionHeader[i].PointerToLinenumbers;
 
-        Sections->push_back(s);
+        Sections.push_back(s);
     }
 
     return Sections;
@@ -158,10 +142,10 @@ list<ProcessData::Section*>* Process::GetSections(string module)
 /*
     ChangeModuleName - Modifies the module name of a loaded module at runtime, which might trip up attackers and make certain parts of their code fail. Please see my project "ChangeModuleName" for more details
     requirements: ensure the new module name is the same or less length of the one you are changing or else you need to shift memory properly where all module names are being stored, and requires additions to this code.
-    
-    returns `true` on success.
+    Originally taken from my other project at: https://github.com/AlSch092/changemodulename
+    returns `true` on successfully renaming `szModule` to `newName`.
 */
-bool Process::ChangeModuleName(const wstring szModule, const wstring newName)
+bool Process::ChangeModuleName(__in const wstring moduleName, __in const  wstring newName)
 {
 #ifdef _M_IX86
     MYPEB* PEB = (MYPEB*)__readfsdword(0x30);
@@ -170,16 +154,17 @@ bool Process::ChangeModuleName(const wstring szModule, const wstring newName)
 #endif
 
     _LIST_ENTRY* f = PEB->Ldr->InMemoryOrderModuleList.Flink;
+
     bool Found = FALSE;
     int count = 0;
 
-    while (!Found && count < 256) //traverse module list , stops at 256 loops to prevent infinite looping incase szModule isn't found
+    while (!Found && count < 1024) //traverse module list , stops at 1024 loops to prevent any possible infinite looping
     {
         MY_PLDR_DATA_TABLE_ENTRY dataEntry = CONTAINING_RECORD(f, MY_LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
 
-        if (wcsstr(dataEntry->FullDllName.Buffer, szModule.c_str()))
+        if (wcsstr(dataEntry->FullDllName.Buffer, moduleName.c_str()))
         {
-            wcscpy_s(dataEntry->FullDllName.Buffer, szModule.size() + 1, newName.c_str()); //..then modify the string modulename to newName
+            wcscpy_s(dataEntry->FullDllName.Buffer, moduleName.size() + 1, newName.c_str()); //..then modify the string modulename to newName
             dataEntry->FullDllName.Length = (newName.length() * 2) + 1;
             dataEntry->FullDllName.MaximumLength = (newName.length() * 2) + 1;
             Found = TRUE;
@@ -197,7 +182,7 @@ bool Process::ChangeModuleName(const wstring szModule, const wstring newName)
     ChangeModuleBase - Changes the DllBase member in the PLDR_DATA_TABLE_ENTRY structure at Ldr->InMemoryOrderLinks. Not confirmed yet if this can trip up attackers, need to do a bit more testing
     returns true on success
 */
-bool Process::ChangeModuleBase(const wchar_t* szModule, uint64_t moduleBaseAddress)
+bool Process::ChangeModuleBase(__in const wchar_t* szModule, __in const  uint64_t moduleBaseAddress)
 {
 #ifdef _M_IX86
     MYPEB* PEB = (MYPEB*)__readfsdword(0x30);
@@ -231,7 +216,7 @@ bool Process::ChangeModuleBase(const wchar_t* szModule, uint64_t moduleBaseAddre
     ChangeModulesChecksum - Changes the `CheckSum` member in the PLDR_DATA_TABLE_ENTRY structure at Ldr->InMemoryOrderLinks
     returns `true` on success
 */
-bool Process::ChangeModulesChecksum(const wchar_t* szModule, DWORD checksum)
+bool Process::ChangeModulesChecksum(__in const  wchar_t* szModule, __in const  DWORD checksum)
 {
 #ifdef _M_IX86
     MYPEB* PEB = (MYPEB*)__readfsdword(0x30);
@@ -266,7 +251,7 @@ bool Process::ChangeModulesChecksum(const wchar_t* szModule, DWORD checksum)
 ChangePEEntryPoint - modifies the `OptionalHeader.AddressOfEntryPoint` in the NT headers to throw off runtime querying by attackers
 returns true on success
 */
-bool Process::ChangePEEntryPoint(DWORD newEntry)
+bool Process::ChangePEEntryPoint(__in const DWORD newEntry)
 {
     PIMAGE_DOS_HEADER pDoH;
     PIMAGE_NT_HEADERS pNtH;
@@ -308,7 +293,7 @@ bool Process::ChangePEEntryPoint(DWORD newEntry)
 ChangeImageSize - modifies the `OptionalHeader.SizeOfImage` in the NT headers to throw off runtime querying by attackers
 returns true on success
 */
-bool Process::ChangeImageSize(DWORD newEntry)
+bool Process::ChangeImageSize(__in const DWORD newEntry)
 {
     PIMAGE_DOS_HEADER pDoH;
     PIMAGE_NT_HEADERS pNtH;
@@ -324,7 +309,7 @@ bool Process::ChangeImageSize(DWORD newEntry)
 
     if (!pNtH) 
     { 
-        Logger::logf("UltimateAnticheat.log", Err, "NTHeader was somehow NULL at ChangeImageSize\n");
+        Logger::logf(Err, "NTHeader was somehow NULL at ChangeImageSize\n");
         return false;
     }
 
@@ -332,7 +317,7 @@ bool Process::ChangeImageSize(DWORD newEntry)
 
     if (!VirtualProtect((LPVOID)pEntry, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &protect))
     {
-        Logger::logf("UltimateAnticheat.log", Err, "VirtualProtect failed at ChangeImageSize: %d\n", GetLastError());
+        Logger::logf(Err, "VirtualProtect failed at ChangeImageSize: %d\n", GetLastError());
         return false;
     }
 
@@ -358,7 +343,7 @@ bool Process::ChangeImageSize(DWORD newEntry)
     ChangeSizeOfCode - modifies the `OptionalHeader.SizeOfCode` in the NT headers to throw off runtime querying by attackers
     returns true on success
 */
-bool Process::ChangeSizeOfCode(DWORD newEntry) //modify the 'sizeofcode' variable in the optionalheader
+bool Process::ChangeSizeOfCode(__in const DWORD newEntry) //modify the 'sizeofcode' variable in the optionalheader
 {
     PIMAGE_DOS_HEADER pDoH;
     PIMAGE_NT_HEADERS pNtH;
@@ -374,7 +359,7 @@ bool Process::ChangeSizeOfCode(DWORD newEntry) //modify the 'sizeofcode' variabl
 
     if (!pNtH)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " NTHeader was somehow NULL @ ChangeSizeOfCode\n");
+        Logger::logf(Err, " NTHeader was somehow NULL @ ChangeSizeOfCode\n");
         return false;
     }
 
@@ -405,7 +390,7 @@ bool Process::ChangeSizeOfCode(DWORD newEntry) //modify the 'sizeofcode' variabl
     ChangeNumberOfSections - changes the number of sections in the NT Headers to `newSectionsCount`, which can stop attackers from traversing sections in our program
     returns true on success
 */
-bool Process::ChangeNumberOfSections(string module, DWORD newSectionsCount)
+bool Process::ChangeNumberOfSections(__in const string module, __in const  DWORD newSectionsCount)
 {
     PIMAGE_SECTION_HEADER sectionHeader = 0;
     HINSTANCE hInst = NULL;
@@ -418,7 +403,7 @@ bool Process::ChangeNumberOfSections(string module, DWORD newSectionsCount)
 
     if (pDoH == NULL || hInst == NULL)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " PIMAGE_DOS_HEADER or hInst was NULL @ Process::ChangeNumberOfSections");
+        Logger::logf(Err, " PIMAGE_DOS_HEADER or hInst was NULL @ Process::ChangeNumberOfSections");
         return false;
     }
 
@@ -429,7 +414,7 @@ bool Process::ChangeNumberOfSections(string module, DWORD newSectionsCount)
 
     if (!VirtualProtect((LPVOID)&pNtH->FileHeader.NumberOfSections, sizeof(DWORD), PAGE_EXECUTE_READWRITE, &dwOldProt))
     {
-        Logger::logf("UltimateAnticheat.log", Err, " VirtualProtect failed @ Process::ChangeNumberOfSections");
+        Logger::logf(Err, " VirtualProtect failed @ Process::ChangeNumberOfSections");
         return false;
     }
 
@@ -437,7 +422,7 @@ bool Process::ChangeNumberOfSections(string module, DWORD newSectionsCount)
 
     if (!VirtualProtect((LPVOID)&pNtH->FileHeader.NumberOfSections, sizeof(DWORD), dwOldProt, &dwOldProt)) //reset page protections
     {
-        Logger::logf("UltimateAnticheat.log", Err, " VirtualProtect (2nd call) failed @ Process::ChangeNumberOfSections");
+        Logger::logf(Err, " VirtualProtect (2nd call) failed @ Process::ChangeNumberOfSections");
         return false;
     }
 
@@ -448,7 +433,7 @@ bool Process::ChangeNumberOfSections(string module, DWORD newSectionsCount)
     ChangeImageBase - Modifies the `OptionalHeader.ImageBase` variable in the NT headers, which might throw off attackers who query this variable
     returns true on success
 */
-bool Process::ChangeImageBase(UINT64 newEntry)
+bool Process::ChangeImageBase(__in const UINT64 newEntry)
 {
     PIMAGE_DOS_HEADER pDoH;
     PIMAGE_NT_HEADERS pNtH;
@@ -463,7 +448,7 @@ bool Process::ChangeImageBase(UINT64 newEntry)
 
     if (!pNtH)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "NTHeader was somehow NULL at ChangeImageBase\n");
+        Logger::logf(Err, "NTHeader was somehow NULL at ChangeImageBase\n");
         return false;
     }
 
@@ -520,17 +505,18 @@ DWORD Process::GetParentProcessId()
     }
     __finally 
     {
-        if (hSnapshot != INVALID_HANDLE_VALUE) 
+        if (hSnapshot != INVALID_HANDLE_VALUE && hSnapshot != 0) 
             CloseHandle(hSnapshot);
     }
     return ppid;
 }
 
 /*
-    GetProcessIdByName - Get pid given a process name
+    GetProcessIdByName - Get first pid given a process name.
+    You should probably use GetProcessIdsByName instead.
     returns a DWORD pid if procName is a running process, otherwise returns 0
 */
-DWORD Process::GetProcessIdByName(wstring procName)
+DWORD Process::GetProcessIdByName(__in const wstring procName)
 {
     PROCESSENTRY32 entry;
     entry.dwSize = sizeof(PROCESSENTRY32);
@@ -542,8 +528,10 @@ DWORD Process::GetProcessIdByName(wstring procName)
     {
         while (Process32Next(snapshot, &entry) == TRUE)
             if (wcscmp(entry.szExeFile, procName.c_str()) == 0)
+            {
                 pid = entry.th32ProcessID;
-                   
+                break;
+            }              
     }
 
     CloseHandle(snapshot);
@@ -552,38 +540,44 @@ DWORD Process::GetProcessIdByName(wstring procName)
 
 
 /*
-RemovePEHeader - Experimental method to zero the memory of the NT headers, not recommended in production code but should trip up quite a few tools in theory
-
+    GetProcessIdsByName - Get all pids given a process name
+    returns a list of DWORD pids of processes running with procName.
 */
-void Process::RemovePEHeader(HANDLE moduleBase)
+list<DWORD> Process::GetProcessIdsByName(__in const wstring procName)
 {
-    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)moduleBase;
-    PIMAGE_NT_HEADERS pNTHeader = (PIMAGE_NT_HEADERS)((PBYTE)pDosHeader + (DWORD)pDosHeader->e_lfanew);
+    if (procName.size() == 0)
+        return {};
 
-    if (pNTHeader->Signature != IMAGE_NT_SIGNATURE)
-        return;
+    list<DWORD> pids;
+    PROCESSENTRY32 entry;
+    entry.dwSize = sizeof(PROCESSENTRY32);
+    DWORD pid = 0;
 
-    if (pNTHeader->FileHeader.SizeOfOptionalHeader)
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+
+    if (Process32First(snapshot, &entry) == TRUE)
     {
-        DWORD Protect;
-        WORD Size = pNTHeader->FileHeader.SizeOfOptionalHeader;
-        VirtualProtect((void*)moduleBase, Size, PAGE_EXECUTE_READWRITE, &Protect);
-        RtlZeroMemory((void*)moduleBase, Size);
-        VirtualProtect((void*)moduleBase, Size, Protect, &Protect);
+        while (Process32Next(snapshot, &entry) == TRUE)
+            if (wcscmp(entry.szExeFile, procName.c_str()) == 0)
+                pids.push_back(entry.th32ProcessID);
+
     }
+
+    CloseHandle(snapshot);
+    return pids;
 }
 
 /*
     GetSectionAddress - Get the address of a named section of the module with the named `moduleName`
     returns a memory address of the section if found, and 0 if no section is found or an error occurs
 */
-UINT64 Process::GetSectionAddress(const char* moduleName, const char* sectionName)
+UINT64 Process::GetSectionAddress(__in const  char* moduleName, __in const  char* sectionName)
 {
     HMODULE hModule = GetModuleHandleA(moduleName);
 
     if (hModule == NULL)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " Failed to get module handle: %d @ GetSectionAddress\n", GetLastError());
+        Logger::logf(Err, " Failed to get module handle: %d @ GetSectionAddress\n", GetLastError());
         return 0;
     }
 
@@ -592,20 +586,20 @@ UINT64 Process::GetSectionAddress(const char* moduleName, const char* sectionNam
     PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)baseAddress;
     if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " Invalid DOS header @ GetSectionAddress.\n");
+        Logger::logf(Err, " Invalid DOS header @ GetSectionAddress.\n");
         return 0;
     }
 
     PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(baseAddress + pDosHeader->e_lfanew);
     if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE)
     {
-        Logger::logf("UltimateAnticheat.log", Err, " Invalid NT header @ GetSectionAddress.\n");
+        Logger::logf(Err, " Invalid NT header @ GetSectionAddress.\n");
         return 0;
     }
 
     PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
 
-    for (int i = 0; i < EXPECTED_SECTIONS; i++)  //we are modifying # of sections at runtime to throw attackers off
+    for (int i = 0; i < Process::GetNumSections(); i++)  //we are modifying # of sections at runtime to throw attackers off
     {
         if ((const char*)pSectionHeader->Name != nullptr)
         {
@@ -618,7 +612,7 @@ UINT64 Process::GetSectionAddress(const char* moduleName, const char* sectionNam
         pSectionHeader++;
     }
 
-    Logger::logf("UltimateAnticheat.log", Warning, ".text section not found.\n");
+    Logger::logf(Warning, ".text section not found.\n");
     return 0;
 }
 
@@ -626,7 +620,7 @@ UINT64 Process::GetSectionAddress(const char* moduleName, const char* sectionNam
     GetBytesAtAddress - return bytes from an address given `size`.
     returns a BYTE array filled with values from `address` for `size` number of bytes
 */
-BYTE* Process::GetBytesAtAddress(UINT64 address, UINT size) //remember to free bytes if not NULL ret
+BYTE* Process::GetBytesAtAddress(__in const UINT64 address, __in const  UINT size) //remember to free bytes if not NULL ret
 {
     BYTE* memBytes = new BYTE[size];
 
@@ -653,7 +647,7 @@ list<ProcessData::ImportFunction*> Process::GetIATEntries()
 
     if (hModule == NULL)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Couldn't fetch module handle @ Process::GetIATEntries ");
+        Logger::logf(Err, "Couldn't fetch module handle @ Process::GetIATEntries ");
         return (list<ProcessData::ImportFunction*>)NULL;
     }
 
@@ -661,7 +655,7 @@ list<ProcessData::ImportFunction*> Process::GetIATEntries()
 
     if (dosHeader == nullptr)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Couldn't fetch dosHeader @ Process::GetIATEntries ");
+        Logger::logf(Err, "Couldn't fetch dosHeader @ Process::GetIATEntries ");
         return (list<ProcessData::ImportFunction*>)NULL;
     }
 
@@ -699,7 +693,7 @@ list<ProcessData::ImportFunction*> Process::GetIATEntries()
     GetModuleSize - get size of a module at address `hModule`
     returns the size of hModule, and 0 if hModule is invalid or error occurs
 */
-DWORD Process::GetModuleSize(HMODULE hModule)
+DWORD Process::GetModuleSize(__in const HMODULE hModule)
 {
     if (hModule == NULL) 
     {
@@ -707,6 +701,7 @@ DWORD Process::GetModuleSize(HMODULE hModule)
     }
 
     MODULEINFO moduleInfo;
+
     if (!GetModuleInformation(GetCurrentProcess(), hModule, &moduleInfo, sizeof(moduleInfo))) 
     {
         return 0;
@@ -740,7 +735,7 @@ bool Process::FillModuleList()
 
             if (GetModuleFileNameEx(GetCurrentProcess(), hModules[i], szModuleName, sizeof(szModuleName) / sizeof(TCHAR))) 
             {
-                wcscpy_s(module->name, szModuleName);
+                module->name = wstring(szModuleName);
 
                 module->hModule = hModules[i];
 
@@ -751,7 +746,7 @@ bool Process::FillModuleList()
                 }
                 else
                 {
-                    Logger::logf("UltimateAnticheat.log", Err, "Unable to parse module information @ Process::FillModuleList");
+                    Logger::logf(Err, "Unable to parse module information @ Process::FillModuleList");
                     return false;
                 }
 
@@ -759,14 +754,14 @@ bool Process::FillModuleList()
             }
             else
             {
-                Logger::logf("UltimateAnticheat.log", Err, "Unable to parse module named @ Process::FillModuleList");
+                Logger::logf(Err, "Unable to parse module named @ Process::FillModuleList");
                 return false;
             }
         }
     }
     else
     {
-        Logger::logf("UltimateAnticheat.log", Err, "EnumProcessModules failed @ Process::FillModuleList");
+        Logger::logf(Err, "EnumProcessModules failed @ Process::FillModuleList");
         return false;
     }
 
@@ -777,7 +772,7 @@ bool Process::FillModuleList()
     ModifyTLSCallbackPtr - changes the program TLS callback at runtime by modifying the data directory ptr (IMAGE_DIRECTORY_ENTRY_TLS)
     returns true on success
 */
-bool Process::ModifyTLSCallbackPtr(UINT64 NewTLSFunction)
+bool Process::ModifyTLSCallbackPtr(__in const UINT64 NewTLSFunction)
 {
     HMODULE hModule = GetModuleHandle(NULL);
     IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)hModule;
@@ -798,7 +793,7 @@ bool Process::ModifyTLSCallbackPtr(UINT64 NewTLSFunction)
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            Logger::logf("UltimateAnticheat.log", Err, "Failed to write TLS callback ptr  @ Process::ModifyTLSCallbackPtr");
+            Logger::logf(Err, "Failed to write TLS callback ptr  @ Process::ModifyTLSCallbackPtr");
             return false;
         }
     }
@@ -810,7 +805,7 @@ bool Process::ModifyTLSCallbackPtr(UINT64 NewTLSFunction)
     _GetProcAddress - Attempt to retrieve address of function of `Module`, given `lpProcName`
     Meant to be used for function lookups without calling GetProcAddress explicitly (may require dynamic analysis instead of static for an attacker)
 */
-FARPROC Process::_GetProcAddress(PCSTR Module, LPCSTR lpProcName)
+FARPROC Process::_GetProcAddress(__in const PCSTR Module, __in const LPCSTR lpProcName)
 {
     if (Module == nullptr || lpProcName == nullptr)
         return (FARPROC)NULL;
@@ -854,7 +849,7 @@ FARPROC Process::_GetProcAddress(PCSTR Module, LPCSTR lpProcName)
         }
         else
         {
-            Logger::logf("UltimateAnticheat.log", Err, "ImageExportDirectory was NULL @ Process::_GetProcAddress with module %s and function %s", Module, lpProcName);
+            Logger::logf(Err, "ImageExportDirectory was NULL @ Process::_GetProcAddress with module %s and function %s", Module, lpProcName);
             UnMapAndLoad(&LoadedImage);
             return NULL;
         }
@@ -863,7 +858,7 @@ FARPROC Process::_GetProcAddress(PCSTR Module, LPCSTR lpProcName)
     }
     else
     {
-        Logger::logf("UltimateAnticheat.log", Err, "MapAndLoad failed @ Process::_GetProcAddress with module %s and function %s", Module, lpProcName);
+        Logger::logf(Err, "MapAndLoad failed @ Process::_GetProcAddress with module %s and function %s", Module, lpProcName);
         return (FARPROC)NULL;
     }
 
@@ -874,11 +869,11 @@ FARPROC Process::_GetProcAddress(PCSTR Module, LPCSTR lpProcName)
     IsReturnAddressInModule - returns true if RetAddr is module's mem region
     Used to detect attackers calling our functions such as heartbeat generation, since they may try to spoof or emulate the net client
 */
-bool Process::IsReturnAddressInModule(UINT64 RetAddr, const wchar_t* module)
+bool Process::IsReturnAddressInModule(__in const UINT64 RetAddr, __in const  wchar_t* module)
 {
     if (RetAddr == 0)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "RetAddr was 0 @ : Process::IsReturnAddressInModule");
+        Logger::logf(Err, "RetAddr was 0 @ : Process::IsReturnAddressInModule");
         return false;
     }
 
@@ -897,7 +892,7 @@ bool Process::IsReturnAddressInModule(UINT64 RetAddr, const wchar_t* module)
 
     if (size == 0)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "size was 0 @ : Process::IsReturnAddressInModule");
+        Logger::logf(Err, "size was 0 @ : Process::IsReturnAddressInModule");
         return false;
     }
 
@@ -912,7 +907,7 @@ bool Process::IsReturnAddressInModule(UINT64 RetAddr, const wchar_t* module)
 /*
        GetProcessName - Returns the string name of a process with id `pid`
 */
-wstring Process::GetProcessName(DWORD pid)
+wstring Process::GetProcessName(__in const DWORD pid)
 {
     std::wstring processName;
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
@@ -929,18 +924,18 @@ wstring Process::GetProcessName(DWORD pid)
             }
             else 
             {
-                Logger::logf("UltimateAnticheat.log", Err, "GetModuleBaseName failed with error %d @  Process::GetProcessName", GetLastError());
+                Logger::logf(Err, "GetModuleBaseName failed with error %d @  Process::GetProcessName", GetLastError());
             }
         }
         else 
         {
-            Logger::logf("UltimateAnticheat.log", Err, "EnumProcessModules failed with error %d @  Process::GetProcessName", GetLastError());
+            Logger::logf(Err, "EnumProcessModules failed with error %d @  Process::GetProcessName", GetLastError());
         }
         CloseHandle(hProcess);
     }
     else 
     {
-        Logger::logf("UltimateAnticheat.log", Err, "OpenProcess failed with error %d @  Process::GetProcessName", GetLastError());
+        Logger::logf(Err, "OpenProcess failed with error %d @  Process::GetProcessName", GetLastError());
     }
 
     return processName;
@@ -950,7 +945,7 @@ wstring Process::GetProcessName(DWORD pid)
     GetLoadedModules - returns a vector<MODULE_DATA>*  representing a set of loaded modules in the current process
     returns nullptr on failure
 */
-std::vector<ProcessData::MODULE_DATA>* Process::GetLoadedModules()
+std::vector<ProcessData::MODULE_DATA> Process::GetLoadedModules()
 {
 
 #ifdef _M_IX86
@@ -966,20 +961,20 @@ std::vector<ProcessData::MODULE_DATA>* Process::GetLoadedModules()
 
     current_record = start->Flink;
 
-    std::vector<ProcessData::MODULE_DATA>* moduleList = new std::vector<ProcessData::MODULE_DATA>();
+    std::vector<ProcessData::MODULE_DATA> moduleList;
 
     while (true)
     {
         MY_LDR_DATA_TABLE_ENTRY* module_entry = (MY_LDR_DATA_TABLE_ENTRY*)CONTAINING_RECORD(current_record, MY_LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
         ProcessData::MODULE_DATA module;
 
-        wcscpy_s(module.name, module_entry->FullDllName.Buffer);
-        wcscpy_s(module.baseName, module_entry->BaseDllName.Buffer);
+        module.name =  wstring(module_entry->FullDllName.Buffer);
+        module.baseName = wstring(module_entry->BaseDllName.Buffer);
 
         module.hModule = (HMODULE)module_entry->DllBase;
         module.dllInfo.lpBaseOfDll = module_entry->DllBase;
         module.dllInfo.SizeOfImage = module_entry->SizeOfImage;
-        moduleList->push_back(module);
+        moduleList.push_back(module);
 
         current_record = current_record->Flink;
 
@@ -996,7 +991,7 @@ std::vector<ProcessData::MODULE_DATA>* Process::GetLoadedModules()
     GetModuleInfo - returns a ProcessData::MODULE_DATA* representing the module given `name`.
     returns nullptr on failure/no module found
 */
-ProcessData::MODULE_DATA* Process::GetModuleInfo(const wchar_t* name)
+ProcessData::MODULE_DATA* Process::GetModuleInfo(__in const  wchar_t* name)
 {
 #ifdef _M_IX86
     MYPEB* peb = (MYPEB*)__readfsdword(0x30);
@@ -1018,8 +1013,9 @@ ProcessData::MODULE_DATA* Process::GetModuleInfo(const wchar_t* name)
         if (wcscmp(module_entry->BaseDllName.Buffer, name) == 0)
         {
             ProcessData::MODULE_DATA* module = new ProcessData::MODULE_DATA();
-            wcscpy_s(module->name, module_entry->FullDllName.Buffer);
-            wcscpy_s(module->baseName, module_entry->BaseDllName.Buffer);
+
+            module->name = wstring(module_entry->FullDllName.Buffer);
+            module->baseName =  wstring(module_entry->BaseDllName.Buffer);
             module->hModule = (HMODULE)module_entry->DllBase;
             module->dllInfo.lpBaseOfDll = module_entry->DllBase;
             module->dllInfo.SizeOfImage = module_entry->SizeOfImage;
@@ -1041,7 +1037,7 @@ ProcessData::MODULE_DATA* Process::GetModuleInfo(const wchar_t* name)
     GetModuleHandle_Ldr - returns base address of a module as HMODULE type
     returns NULL on failure
 */
-HMODULE Process::GetModuleHandle_Ldr(const wchar_t* moduleName)
+HMODULE Process::GetModuleHandle_Ldr(__in const  wchar_t* moduleName)
 {
 #ifdef _M_IX86
     MYPEB* peb = (MYPEB*)__readfsdword(0x30);
@@ -1076,19 +1072,19 @@ HMODULE Process::GetModuleHandle_Ldr(const wchar_t* moduleName)
     return (HMODULE)NULL;
 }
 
-DWORD Process::GetTextSectionSize(HMODULE hModule)
+DWORD Process::GetTextSectionSize(__in const HMODULE hModule)
 {
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
     if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Invalid DOS signature @ GetTextSectionSize");
+        Logger::logf(Err, "Invalid DOS signature @ GetTextSectionSize");
         return 0;
     }
 
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dosHeader->e_lfanew);
     if (ntHeaders->Signature != IMAGE_NT_SIGNATURE)
     {
-        Logger::logf("UltimateAnticheat.log", Err, "Invalid NT signature @ GetTextSectionSize");
+        Logger::logf(Err, "Invalid NT signature @ GetTextSectionSize");
         return 0;
     }
 
@@ -1108,7 +1104,7 @@ DWORD Process::GetTextSectionSize(HMODULE hModule)
 /*
     GetRemoteModuleBaseAddress - fetch module base address of `moduleName` in `processId`
 */
-HMODULE Process::GetRemoteModuleBaseAddress(DWORD processId, const wchar_t* moduleName) 
+HMODULE Process::GetRemoteModuleBaseAddress(__in const DWORD processId, __in const  wchar_t* moduleName)
 {
     HMODULE hModule = NULL;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
@@ -1132,32 +1128,73 @@ HMODULE Process::GetRemoteModuleBaseAddress(DWORD processId, const wchar_t* modu
     return hModule;
 }
 
-bool Process::GetRemoteTextSection(HANDLE hProcess, uintptr_t& baseAddress, SIZE_T& sectionSize) 
+bool Process::GetRemoteTextSection(__in const HANDLE hProcess, __out uintptr_t& baseAddress, __out SIZE_T& sectionSize)
 {
-    MEMORY_BASIC_INFORMATION mbi;
-    uintptr_t address = 0;
+    HMODULE hModule = nullptr;
+    MODULEENTRY32 me32;
+    me32.dwSize = sizeof(MODULEENTRY32);
 
-    while (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) == sizeof(mbi)) 
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetProcessId(hProcess));
+    if (hSnapshot == INVALID_HANDLE_VALUE)
+        return false;
+
+    if (Module32First(hSnapshot, &me32))
+        hModule = me32.hModule;
+
+    if(hSnapshot)
+        CloseHandle(hSnapshot);
+
+    if (!hModule)
+        return false;
+
+    IMAGE_DOS_HEADER dosHeader;
+    SIZE_T bytesRead = 0;
+
+    if (!ReadProcessMemory(hProcess, hModule, &dosHeader, sizeof(dosHeader), &bytesRead) || bytesRead != sizeof(dosHeader))
+        return false;
+
+    if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+
+    IMAGE_NT_HEADERS ntHeaders;
+    if (!ReadProcessMemory(hProcess, (LPCVOID)((uintptr_t)hModule + dosHeader.e_lfanew), &ntHeaders, sizeof(ntHeaders), &bytesRead) || bytesRead != sizeof(ntHeaders))
+        return false;
+
+    if (ntHeaders.Signature != IMAGE_NT_SIGNATURE)
+        return false;
+
+    IMAGE_SECTION_HEADER sectionHeader;
+    uintptr_t sectionOffset = (uintptr_t)hModule + dosHeader.e_lfanew + offsetof(IMAGE_NT_HEADERS, OptionalHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
+
+    for (WORD i = 0; i < ntHeaders.FileHeader.NumberOfSections; i++)
     {
-        // Check if the memory region is committed and executable
-        if ((mbi.State == MEM_COMMIT) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) 
+        if (!ReadProcessMemory(hProcess, (LPCVOID)sectionOffset, &sectionHeader, sizeof(sectionHeader), &bytesRead) || bytesRead != sizeof(sectionHeader))
+            return false;
+
+        if (memcmp(sectionHeader.Name, ".text", 5) == 0)
         {
-            // Optionally: refine this logic to inspect PE headers to ensure it's the `.text` section
-            baseAddress = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-            sectionSize = mbi.RegionSize;
+            baseAddress = (uintptr_t)hModule + sectionHeader.VirtualAddress;
+            sectionSize = sectionHeader.Misc.VirtualSize;
             return true;
         }
-        address += mbi.RegionSize;
+
+        sectionOffset += sizeof(IMAGE_SECTION_HEADER);
     }
+
     return false;
 }
 
-std::vector<BYTE> Process::ReadRemoteTextSection(DWORD pid) 
+
+std::vector<BYTE> Process::ReadRemoteTextSection(__in const DWORD pid)
 {
+	if (pid <= 4) //system processes
+        return {};
+
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+
     if (!hProcess) 
     {
-        std::cerr << "Failed to open process. Error: " << GetLastError() << std::endl;
+        Logger::logf(Err, "Failed to open process. Error: %d", GetLastError());
         return {};
     }
 
@@ -1166,7 +1203,7 @@ std::vector<BYTE> Process::ReadRemoteTextSection(DWORD pid)
 
     if (!GetRemoteTextSection(hProcess, baseAddress, sectionSize)) 
     {
-        std::cerr << "Failed to find the .text section." << std::endl;
+        Logger::log(Err, "Failed to find the .text section.");
         CloseHandle(hProcess);
         return {};
     }
@@ -1176,12 +1213,12 @@ std::vector<BYTE> Process::ReadRemoteTextSection(DWORD pid)
     SIZE_T bytesRead = 0;
     if (!ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(baseAddress), buffer.data(), sectionSize, &bytesRead)) 
     {
-        std::cerr << "Failed to read memory. Error: " << GetLastError() << std::endl;
+        Logger::logf(Err, "Failed to read memory. Error: %d",  GetLastError());
         CloseHandle(hProcess);
         return {};
     }
 
-    buffer.resize(bytesRead); // Resize to actual bytes read
+    buffer.resize(bytesRead); //resize to actual bytes read
     CloseHandle(hProcess);
 
     return buffer;

@@ -3,12 +3,15 @@
 #include "../Common/Logger.hpp"
 #include "../AntiTamper/NAuthenticode.hpp"
 #include "../Common/Utility.hpp"
+#include "../Network/HttpClient.hpp"
+
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <tchar.h>
 #include <intrin.h>
+#include <sstream>
 
 #pragma comment(lib, "setupapi.lib")
 
@@ -39,8 +42,8 @@ struct DeviceW
 enum WindowsVersion
 {									//Major,Minor :
 	Windows2000 = 50,				//5,0
-	WindowsXP = 51,			    //5,1
-	WindowsXPProfessionalx64 = 52,	//5,2
+	WindowsXP = 51,			                //5,1
+	WindowsXPProfessionalx64 = 52,	                //5,2
 	WindowsVista = 60,				//6,0
 	Windows7 = 61,					//6,1
 	Windows8 = 62,					//6,2
@@ -58,59 +61,26 @@ class Services final
 {
 public:
 
-	Services(bool Initialize)
+	Services()
 	{
-		if (Initialize)
-		{
-			HardwareDevices = GetHardwareDevicesW(); //fetch PCI devices
 
-			//in a real world application we would of course obfuscate these strings at compile time
-			BlacklistedDrivers.push_back(L"ntguard.sys"); //Net-Ease anti-cheat -> Vulnerable
-			BlacklistedDrivers.push_back(L"BEDaisy.sys"); //battleEye older versions are vulnerable to read/write kernel memory
-			BlacklistedDrivers.push_back(L"Gdrv.sys"); //gigabyte, vulnerable IOCTLs to r/w to physical memory
-			BlacklistedDrivers.push_back(L"AsIO.sys"); //asus utilities
-			BlacklistedDrivers.push_back(L"AsUpIO.sys");  //asus utilities
-			BlacklistedDrivers.push_back(L"CPUID.sys"); //direct memory access & manipulation
-			BlacklistedDrivers.push_back(L"ENE.sys"); //older versions vulnerable
-			BlacklistedDrivers.push_back(L"iqvw64e.sys"); //direct memory access, used in manually mapping drivers
-			BlacklistedDrivers.push_back(L"hxctl.sys"); //Huorong Security, allow execute kernel code
-			BlacklistedDrivers.push_back(L"kprocesshacker.sys"); //process hacker's driver allows reading + writing to phys memory
-			BlacklistedDrivers.push_back(L"kprocesshacker2.sys"); //process hacker's driver allows reading + writing to phys memory
-			BlacklistedDrivers.push_back(L"EIO64.sys");
-			BlacklistedDrivers.push_back(L"IOMap64.sys");
-			BlacklistedDrivers.push_back(L"ATSZIO64.sys");
-			BlacklistedDrivers.push_back(L"atillk64.sys");
-			BlacklistedDrivers.push_back(L"aswVmm.sys"); //ssdt hooking
-			BlacklistedDrivers.push_back(L"BS_Flash64.sys");
-			BlacklistedDrivers.push_back(L"Capcom.sys");
-			BlacklistedDrivers.push_back(L"cpuz141.sys"); //phys read/write
-			BlacklistedDrivers.push_back(L"WinRing0x64.sys");
-			BlacklistedDrivers.push_back(L"FairplayKD.sys");
-			BlacklistedDrivers.push_back(L"pgldqpoc.sys");
-			BlacklistedDrivers.push_back(L"HwOs2Ec10x64.sys"); //APC injection
-			BlacklistedDrivers.push_back(L"Phymemx64.sys");
-			BlacklistedDrivers.push_back(L"Monitor_win10_x64.sys");
-			BlacklistedDrivers.push_back(L"driver.sys");
-			BlacklistedDrivers.push_back(L"lha.sys");
-			BlacklistedDrivers.push_back(L"Mslo64.sys");
-			BlacklistedDrivers.push_back(L"NTIOLib_x64.sys");
-			BlacklistedDrivers.push_back(L"pcdsrvc_x64.pkms");
-			BlacklistedDrivers.push_back(L"HWiNFO64A.sys");
-			BlacklistedDrivers.push_back(L"rzpnk.sys"); //CVE-2017-9769
-			BlacklistedDrivers.push_back(L"magdrvamd64.sys");
-			BlacklistedDrivers.push_back(L"speedfan.sys");
-			BlacklistedDrivers.push_back(L"zam64.sys");
-			BlacklistedDrivers.push_back(L"DBK64.sys"); //cheat engine dark byte VM driver
+		HardwareDevices = GetHardwareDevicesW(); //fetch PCI devices
+		GetLoadedDrivers();
+		GetServiceModules();
 
-		    GetLoadedDrivers();
-		    GetServiceModules();
-		}
+		//these 3 drivers are unsigned, and have no file on disk but cant still run in memory while secure boot & DSE is on - crash-dump related drivers windows uses
+		WhitelistedUnsignedDrivers.emplace_back(wstring(L"\\SystemRoot\\System32\\Drivers\\dump_diskdump.sys"));
+		WhitelistedUnsignedDrivers.emplace_back(wstring(L"\\SystemRoot\\System32\\Drivers\\dump_storahci.sys"));
+		WhitelistedUnsignedDrivers.emplace_back(wstring(L"\\SystemRoot\\System32\\Drivers\\dump_dumpfve.sys"));
+
+		FetchBlacklistedDrivers(BlacklistedDriversRepository);		
 	}
 
 	~Services()
 	{
 		for (auto it = ServiceList.begin(); it != ServiceList.end(); ++it) 
-			delete* it;
+			if(*it != nullptr)
+				delete* it;
 		
 		ServiceList.clear();
 	}
@@ -124,12 +94,11 @@ public:
 	BOOL GetServiceModules(); //adds to `ServiceList`
 
 	list<wstring> GetUnsignedDrivers();
+	list<wstring> GetUnsignedDrivers(__in list<wstring>& cachedVerifiedDriverList);
 
 	static BOOL IsTestsigningEnabled();
 	static BOOL IsDebugModeEnabled();
-	
 	static BOOL IsSecureBootEnabled();
-	static BOOL IsSecureBootEnabled_RegKey(); //check by reg key
 
 	static string GetWindowsDrive();
 	static wstring GetWindowsDriveW();
@@ -141,19 +110,32 @@ public:
 
 	static WindowsVersion GetWindowsVersion();
 	
-	static bool IsHypervisor();
-	static void GetHypervisorVendor(__out char vendor[13]);
+	static bool IsHypervisorPresent();
+	static string GetHypervisorVendor();
+	static string GetCPUVendor();
+	
+	static string GetProcessDirectory(__in const DWORD pid); //fetch the directory of `pid`
+	static wstring GetProcessDirectoryW(__in const DWORD pid); //fetch the directory of `pid`
 
-	static bool LoadDriver(const std::wstring& driverName, const std::wstring& driverPath);
-	static bool UnloadDriver(const std::wstring& driverName); 
+	static list<DWORD> EnumerateProcesses(); //fetch process list
+
+	static bool LoadDriver(__in const std::wstring& serviceName, __in const std::wstring& driverPath); //load `driverPath` with service name `driverName`
+	static bool UnloadDriver(__in const std::wstring& serviceName);
+	static bool IsDriverRunning(__in const std::wstring& serviceName); //check if a driver is loaded & in a running state
 
 private:
 
 	list<Service*> ServiceList;
-	list <wstring> DriverPaths;
+
+	list <wstring> DriverPaths; //list of all loaded drivers
 
 	list<DeviceW> HardwareDevices;
 
-	list<wstring> BlacklistedDrivers; //vulnerable driver list (BYOVD concept) which allow an attacker to read/write mem while having test signing/secure boot enabled 
+	list<wstring> BlacklistedDrivers; //vulnerable driver list (BYOVD concept) which allow an attacker to read/write mem while having test signing or secure boot enabled 
 	list<wstring> FoundBlacklistedDrivers; //any drivers which are loaded and blacklisted
+
+	list<wstring> WhitelistedUnsignedDrivers; // dump_diskdump.sys, dump_storahci.sys, dump_dumpfve.sys
+
+	bool FetchBlacklistedDrivers(__in const char* url);
+	const char* BlacklistedDriversRepository = "https://raw.githubusercontent.com/AlSch092/UltimateAntiCheat/refs/heads/main/MiscFiles/BlacklistedDriverList.txt"; 
 };

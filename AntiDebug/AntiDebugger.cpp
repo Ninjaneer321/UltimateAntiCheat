@@ -6,21 +6,15 @@
 */
 void Debugger::AntiDebug::StartAntiDebugThread()
 {
-	if (!this->GetSettings()->bUseAntiDebugging)
+	if (this->GetSettings() != nullptr && !this->GetSettings()->bUseAntiDebugging)
 	{
-		Logger::logf("UltimateAnticheat.log", Info, "Anti-Debugger was disabled in settings, debugging will be allowed");
+		Logger::logf(Info, "Anti-Debugger was disabled in settings, debugging will be allowed");
 		return;
 	}
 
-	this->DetectionThread = make_unique<Thread>((LPTHREAD_START_ROUTINE)Debugger::AntiDebug::CheckForDebugger, (LPVOID)this, true);
+	this->DetectionThread = make_unique<Thread>((LPTHREAD_START_ROUTINE)Debugger::AntiDebug::CheckForDebugger, (LPVOID)this, true, false);
 
-	if (this->DetectionThread->GetHandle() == INVALID_HANDLE_VALUE || this->DetectionThread->GetHandle() == NULL)
-	{
-		Logger::logf("UltimateAnticheat.log", Err, "Couldn't start anti-debug thread @ Debugger::AntiDebug::StartAntiDebugThread");
-		//optionally shut down here if thread creation fails
-	}
-
-	Logger::logf("UltimateAnticheat.log", Info, "Created Debugger detection thread with Id: %d", this->DetectionThread->GetId());
+	Logger::logf(Info, "Created Debugger detection thread with Id: %d", this->DetectionThread->GetId());
 }
 
 /*
@@ -30,13 +24,13 @@ void Debugger::AntiDebug::CheckForDebugger(LPVOID AD)
 {
 	if (AD == nullptr)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "AntiDbg class was NULL @ CheckForDebugger");
+		Logger::logf(Err, "AntiDbg class was NULL @ CheckForDebugger");
 		return;
 	}
 
 	Debugger::AntiDebug* AntiDbg = reinterpret_cast<Debugger::AntiDebug*>(AD);
 
-	Logger::logf("UltimateAnticheat.log", Info, "STARTED Debugger detection thread");
+	Logger::logf(Info, "STARTED Debugger detection thread");
 
 	bool MonitoringDebugger = true;
 
@@ -46,13 +40,13 @@ void Debugger::AntiDebug::CheckForDebugger(LPVOID AD)
 	{
 		if (AntiDbg == NULL)
 		{
-			Logger::logf("UltimateAnticheat.log", Err, "AntiDbg class was NULL @ CheckForDebugger");
+			Logger::logf(Err, "AntiDbg class was NULL @ CheckForDebugger");
 			return;
 		}
 
 		if (AntiDbg->DetectionThread->IsShutdownSignalled())
 		{
-			Logger::logf("UltimateAnticheat.log", Info, "Shutting down Debugger detection thread with Id: %d", AntiDbg->DetectionThread->GetId());
+			Logger::logf(Info, "Shutting down Debugger detection thread with Id: %d", AntiDbg->DetectionThread->GetId());
 			return; //exit thread
 		}
 
@@ -60,7 +54,7 @@ void Debugger::AntiDebug::CheckForDebugger(LPVOID AD)
 
 		if (CheckHardwareRegistersThread == INVALID_HANDLE_VALUE || CheckHardwareRegistersThread == NULL)
 		{
-			Logger::logf("UltimateAnticheat.log", Warning, "Failed to create new thread to call _IsHardwareDebuggerPresent: %d", GetLastError());
+			Logger::logf(Warning, "Failed to create new thread to call _IsHardwareDebuggerPresent: %d", GetLastError());
 		}
 		else
 		{
@@ -69,7 +63,12 @@ void Debugger::AntiDebug::CheckForDebugger(LPVOID AD)
 
 		if (AntiDbg->RunDetectionFunctions())
 		{
-			Logger::logf("UltimateAnticheat.log", Info, "Atleast one debugger detection function caught a debugger!"); //optionally, iterate over DetectedMethods list
+			Logger::logf(Info, "Atleast one debugger detection function caught a debugger!"); //optionally, iterate over DetectedMethods list if you want a more granular logging 
+		}
+
+		if (AntiDbg->IsDBK64DriverLoaded())
+		{
+			AntiDbg->EvidenceManager->AddFlagged(DetectionFlags::DEBUG_DBK64_DRIVER);
 		}
 
 		Sleep(MonitorLoopDelayMS);
@@ -84,7 +83,7 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 {
 	if (AD == nullptr)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "AntiDbg class was NULL @ _IsHardwareDebuggerPresent");
+		Logger::logf(Err, "AntiDbg class was NULL @ _IsHardwareDebuggerPresent");
 		return;
 	}
 
@@ -96,7 +95,7 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 	HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
 	if (hThreadSnap == INVALID_HANDLE_VALUE)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "Error: unable to create toolhelp snapshot: %d\n", GetLastError());
+		Logger::logf(Err, "Error: unable to create toolhelp snapshot: %d\n", GetLastError());
 		return;
 	}
 
@@ -112,7 +111,7 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 
 				if (hThread == NULL)
 				{
-					Logger::logf("UltimateAnticheat.log", Warning, "Error: unable to OpenThread on thread with id %d\n", te32.th32ThreadID);
+					Logger::logf(Warning, "Error: unable to OpenThread on thread with id %d\n", te32.th32ThreadID);
 					continue;
 				}
 
@@ -125,10 +124,10 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 				{
 					if (context.Dr0 || context.Dr1 || context.Dr2 || context.Dr3 || context.Dr6 || context.Dr7)
 					{
-						Logger::logf("UltimateAnticheat.log", Detection, "Found at least one debug register enabled (hardware debugging)");
+						Logger::logf(Detection, "Found at least one debug register enabled (hardware debugging)");
 						ResumeThread(hThread);
 
-						if (!AntiDbg->Flag(Detections::HARDWARE_REGISTERS))
+						if (!AntiDbg->EvidenceManager->AddFlagged(DetectionFlags::DEBUG_HARDWARE_REGISTERS))
 						{ //optionally take further action, `Flag` will already log a warning
 						}
 
@@ -139,7 +138,7 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 				}
 				else
 				{
-					Logger::logf("UltimateAnticheat.log", Err, "GetThreadContext failed with: %d", GetLastError());
+					Logger::logf(Err, "GetThreadContext failed with: %d", GetLastError());
 					ResumeThread(hThread);
 					CloseHandle(hThread);
 					continue;
@@ -152,62 +151,12 @@ void Debugger::AntiDebug::_IsHardwareDebuggerPresent(LPVOID AD)
 	}
 	else
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "Thread32First Failed: %d\n", GetLastError());
+		Logger::logf(Err, "Thread32First Failed: %d\n", GetLastError());
 		return;
 	}
 
 	CloseHandle(hThreadSnap);
 	return;
-}
-
-/*
-	AddDetectedFlag - adds `flag` to DebuggerMethodsDetected after checking for duplicate entry
-	returns FALSE if `flag` is duplicate entry
-*/
-inline bool Debugger::AntiDebug::AddDetectedFlag(Detections flag)
-{
-	bool isDuplicate = false;
-
-	for (Detections f : this->DebuggerMethodsDetected)
-	{
-		if (f == flag)
-		{
-			isDuplicate = true;
-		}
-	}
-
-	if (!isDuplicate)
-		this->DebuggerMethodsDetected.push_back(flag);
-
-	return isDuplicate;
-}
-
-/*
-	Flag - adds `flag` to detected methods list and tells server we've caught a debugger
-	returns false on error, true on success
-*/
-bool Debugger::AntiDebug::Flag(Debugger::Detections flag)
-{
-	bool wasDuplicate = AddDetectedFlag(flag);
-
-	if (wasDuplicate)
-		return true; //function still succeeds even though it was duplicate (no error)
-
-	if (this->GetNetClient() != nullptr)
-	{
-		if (this->GetNetClient()->FlagCheater(DetectionFlags::DEBUGGER) != Error::OK) //the type of debugger doesn't really matter at the server-side, we can optionally modify the outbound packet to make debugger detections more granular
-		{
-			Logger::logf("UltimateAnticheat.log", Err, "Failed to notify server of caught debugger status");
-			return false;
-		}
-	}
-	else
-	{
-		Logger::logf("UltimateAnticheat.log", Err, "NetClient was NULL @ AntiDebug::Flag");
-		return false;
-	}
-
-	return true;
 }
 
 /*
@@ -219,7 +168,7 @@ bool Debugger::AntiDebug::PreventWindowsDebuggers()
 
 	if (!ntdll)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "Failed to find ntdll.dll @ AntiDebug::PreventWindowsDebuggers");
+		Logger::logf(Err, "Failed to find ntdll.dll @ AntiDebug::PreventWindowsDebuggers");
 		return false;
 	}
 
@@ -238,7 +187,7 @@ bool Debugger::AntiDebug::PreventWindowsDebuggers()
 			}
 			__except(EXCEPTION_EXECUTE_HANDLER)
 			{
-				Logger::logf("UltimateAnticheat.log", Err, "Failed to patch over DbgBreakpoint @ AntiDebug::PreventWindowsDebuggers");
+				Logger::logf(Err, "Failed to patch over DbgBreakpoint @ AntiDebug::PreventWindowsDebuggers");
 				return false;
 			}
 
@@ -256,14 +205,40 @@ bool Debugger::AntiDebug::PreventWindowsDebuggers()
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER)
 			{
-				Logger::logf("UltimateAnticheat.log", Err, "Failed to patch over DbgUiRemoteBreakin @ AntiDebug::PreventWindowsDebuggers");
+				Logger::logf(Err, "Failed to patch over DbgUiRemoteBreakin @ AntiDebug::PreventWindowsDebuggers");
 				return false;
 			}
 
-			VirtualProtect((LPVOID)DbgUiRemoteBreakin_Address, 1, dwOldProt, &dwOldProt);
+			VirtualProtect((LPVOID)DbgUiRemoteBreakin_Address, 1, dwOldProt, &dwOldProt); //set back original protections
 		}
 	}
 
 	return true;
+}
 
+/*
+	HideThreadFromDebugger - hides `hThread` from windows debuggers by calling NtSetInformationThread
+	returns `true` on success
+*/
+bool Debugger::AntiDebug::HideThreadFromDebugger(HANDLE hThread)
+{
+	typedef NTSTATUS(NTAPI* pNtSetInformationThread) (HANDLE, UINT, PVOID, ULONG);
+	NTSTATUS Status;
+
+	pNtSetInformationThread NtSetInformationThread = (pNtSetInformationThread)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationThread");
+
+	if (NtSetInformationThread == NULL)
+		return false;
+
+	if (hThread == NULL)
+		Status = NtSetInformationThread(GetCurrentThread(), 0x11, 0, 0);
+	else
+		Status = NtSetInformationThread(hThread, 0x11, 0, 0);
+
+	return (Status == 0);
+}
+
+bool Debugger::AntiDebug::IsDBK64DriverLoaded()
+{
+	return Services::IsDriverRunning(this->DBK64Driver);
 }

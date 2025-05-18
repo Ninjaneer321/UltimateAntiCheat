@@ -5,7 +5,7 @@
 	Initialize - Initializes the network client
 	returns Error::OK on success
 */
-Error NetClient::Initialize(string ip, uint16_t port, string gameCode)
+Error NetClient::Initialize(__in const std::string ip, __in const uint16_t port, __in const std::string gameCode)
 {
 	WSADATA wsaData;
 	SOCKET Socket = INVALID_SOCKET;
@@ -48,26 +48,17 @@ Error NetClient::Initialize(string ip, uint16_t port, string gameCode)
 		return Error::CANT_SEND;
 	}
 
-	Thread* RecvThread = GetRecvThread();
+	RecvLoopThread = new Thread((LPTHREAD_START_ROUTINE)&NetClient::ProcessRequests, this, true, false);
 
-	if (RecvThread == NULL)
+	if (RecvLoopThread->GetId() == 0)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "RecvThread was NULL @ NetClient::Initialize");
+		Logger::logf(Err, "RecvThread was NULL @ NetClient::Initialize");
 		closesocket(Socket);
 		WSACleanup();
 		shutdown(Socket, 0);
-		return Error::GENERIC_FAIL;
-	}
-
-	RecvLoopThread = new Thread((LPTHREAD_START_ROUTINE)&NetClient::ProcessRequests, this, true);
-
-	if (RecvThread->GetHandle() == NULL || RecvThread->GetHandle() == INVALID_HANDLE_VALUE)
-	{
-		Logger::logf("UltimateAnticheat.log", Err, "Couldn't create recvThread @ NetClient::Initialize");
-
 		return Error::NO_RECV_THREAD;
 	}
-	
+
 	this->Ip = ip;
 	this->Port = port;
 
@@ -81,7 +72,7 @@ Error NetClient::Initialize(string ip, uint16_t port, string gameCode)
 	EndConnection - Ends the net connection with the server
 	returns Error::OK on success
 */
-Error NetClient::EndConnection(int reason)
+Error NetClient::EndConnection(__in const int reason)
 {
 	PacketWriter* p = Packets::Builder::ClientGoodbye(reason);
 	Error err = Error::OK;
@@ -113,7 +104,7 @@ Error NetClient::EndConnection(int reason)
 	returns Error::OK on success
 	Function deletes memory of outPacket on success 
 */
-Error NetClient::SendData(PacketWriter* outPacket)
+Error NetClient::SendData(__in PacketWriter* outPacket)
 {
 	if (outPacket->GetBuffer() == nullptr || outPacket == nullptr)
 		return Error::NULL_MEMORY_REFERENCE;
@@ -127,13 +118,17 @@ Error NetClient::SendData(PacketWriter* outPacket)
 
 	Error err = Error::OK;
 
-	int BytesSent = send(Socket, (const char*)encryptedBuffer, outPacket->GetSize(), 0); //if this ever fragments i'll add a check
-
-	int nRecvDataLength = 0;
-
-	if (BytesSent != outPacket->GetSize()) //make sure we sent the hwid
 	{
-		err = Error::INCOMPLETE_SEND;
+		std::lock_guard<std::mutex> lock(SendPacketMutex);
+
+		int BytesSent = send(Socket, (const char*)encryptedBuffer, outPacket->GetSize(), 0); //if this ever fragments i'll add a check
+
+		int nRecvDataLength = 0;
+
+		if (BytesSent != outPacket->GetSize()) //make sure we sent the hwid
+		{
+			err = Error::INCOMPLETE_SEND;
+		}
 	}
 
 	delete outPacket;
@@ -143,19 +138,25 @@ Error NetClient::SendData(PacketWriter* outPacket)
 /*
 	ProcessRequests - reads packet sent from the server in a loop
 */
-void NetClient::ProcessRequests(LPVOID Param)
+void NetClient::ProcessRequests(__in LPVOID Param)
 {
+	if (Param == nullptr)
+	{
+		Logger::logf(Info, "NetClient class pointer was nullptr @ ProcessRequests");
+		return;
+	}
+
 	bool receiving = true;
 	const int ms_between_loops = 1000;
 	unsigned char recvBuf[DEFAULT_RECV_LENGTH] = { 0 };
 
-	Logger::logf("UltimateAnticheat.log", Info, "Started thread on NetClient::ProcessRequests with id: %d", GetCurrentThreadId());
+	Logger::logf(Info, "Started thread on NetClient::ProcessRequests with id: %d", GetCurrentThreadId());
 
 	NetClient* Client = reinterpret_cast<NetClient*>(Param);
 
 	if (Client == nullptr)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "Client was NULL @ NetClient::ProcessRequests");
+		Logger::logf(Err, "Client was NULL @ NetClient::ProcessRequests");
 		receiving = false; //todo: send signals to rest of anticheat to shutdown
 		goto end;
 	}
@@ -171,7 +172,15 @@ void NetClient::ProcessRequests(LPVOID Param)
 
 		if (s)
 		{
-			int bytesIn = recv(s, (char*)recvBuf, DEFAULT_RECV_LENGTH, 0);
+			int bytesIn = 0;
+
+			{
+				std::lock_guard<std::mutex> lock(Client->RecvPacketMutex);
+				bytesIn = recv(s, (char*)recvBuf, DEFAULT_RECV_LENGTH, 0);
+			}
+
+			if (bytesIn == 0)
+				continue;
 
 			if (bytesIn != SOCKET_ERROR)
 			{
@@ -186,7 +195,7 @@ void NetClient::ProcessRequests(LPVOID Param)
 		}
 		else if(s == SOCKET_ERROR)
 		{
-			Logger::logf("UltimateAnticheat.log", Err, "Socket error @  NetClient::ProcessRequests");
+			Logger::logf(Err, "Socket error @  NetClient::ProcessRequests");
 			receiving = false; //todo: send signals to rest of anticheat to shutdown
 		}
 
@@ -200,9 +209,9 @@ end:
 }
 
 /*
-	GetHostname - returns local ip of host
+	GetHostname - returns local ip of host (ex, 192.168.2.1)
 */
-string NetClient::GetHostname()
+std::string NetClient::GetHostname()
 {
 	struct IPv4
 	{
@@ -210,7 +219,7 @@ string NetClient::GetHostname()
 	};
 
 	IPv4 myIP;
-	string sIpv4;
+	std::string sIpv4;
 
 	char szBuffer[1024];
 
@@ -261,6 +270,170 @@ string NetClient::GetHostname()
 }
 
 /*
+	HandleInboundPacket - read packet `p`  and take action based on its opcode
+*/
+Error NetClient::HandleInboundPacket(__in PacketReader* p)
+{
+	if (p == nullptr)
+		return Error::NULL_MEMORY_REFERENCE;
+
+	Error err = Error::OK;
+
+	uint16_t opcode = p->readShort();
+
+	switch (opcode) //parse server-to-client packets
+	{
+		case Packets::Opcodes::SC_HELLO: //AC initialization can possibly be put into this handler. server is confirming game license code was fine
+		{
+			uint16_t softwareVersion = p->readShort();
+			HandshakeCompleted = true;
+			Logger::logf(Info, "Got reply from server with version: %d", softwareVersion);
+		}break;
+
+		case Packets::Opcodes::SC_HEARTBEAT: //auth cookie every few minutes
+		{
+			short cookie_len = p->readShort();
+
+			if (cookie_len != 128)
+				return Error::INCOMPLETE_RECV;
+
+			string cookie = p->readString(128);
+
+			const char* ResponseCookie = MakeHeartbeat(cookie);
+
+			if (ResponseCookie != NULL)
+			{
+				PacketWriter* Response = Packets::Builder::Heartbeat(ResponseCookie);
+
+				if (SendData(Response) != Error::OK)
+				{
+					Logger::logf(Err, "Could not send heartbeat @ HandleInboundPacket");
+					err = Error::BAD_HEARTBEAT;
+				}
+
+				delete[] ResponseCookie;
+				ResponseCookie = nullptr; //remove use-after-free possibility
+			}
+			else
+			{
+				Logger::logf(Err, "Failed to generate heartbeat @ HandleInboundPacket");
+				err = Error::BAD_HEARTBEAT;
+			}
+		}break;
+
+		case Packets::Opcodes::SC_QUERY_MEMORY: //server requests byte data @ address
+		{
+			uint64_t address = p->readLong();
+			uint32_t size = p->readInt();
+
+			if (QueryMemory(address, size) != Error::OK)
+			{
+				Logger::logf(Err, "Could not query memory bytes for server auth @ HandleInboundPacket");
+				err = Error::GENERIC_FAIL;
+			}
+		}break;
+
+		default:
+			err = Error::BAD_OPCODE;
+			break;
+	}
+
+	return err;
+}
+
+/*
+	FlagCheater - tells server the client has detected cheating
+	returns Error::OK on success
+*/
+Error NetClient::FlagCheater(__in const DetectionFlags flag)
+{
+	PacketWriter* outBytes = Packets::Builder::DetectedCheater(flag);
+	return SendData(outBytes);
+}
+
+/*
+	FlagCheater - tells server the client has detected cheating, along with some additional supporting data
+	returns Error::OK on success
+*/
+Error NetClient::FlagCheater(__in const DetectionFlags flag, __in const std::string data, __in const DWORD pid)
+{
+	PacketWriter* outBytes = Packets::Builder::DetectedCheater(flag, data, pid);
+	return SendData(outBytes);
+}
+
+/*
+	QueryMemory - Server requested client to read bytes @ some memory address
+	returns Error::OK on success
+*/
+Error NetClient::QueryMemory(__in const uint64_t address, __in const uint32_t size)
+{
+	if (size == 0 || address == 0)
+	{
+		Logger::logf(Err, "Failed to fetch bytes at memory address (size or address was 0) @ NetClient::QueryMemory");
+		return Error::INCOMPLETE_SEND;
+	}
+
+	BYTE* bytes = Process::GetBytesAtAddress(address, size);
+
+	if (bytes == nullptr)
+	{
+		Logger::logf(Err, "Failed to fetch bytes at memory address @ NetClient::QueryMemory");
+		return Error::NULL_MEMORY_REFERENCE;
+	}
+
+	PacketWriter* outBytes = Packets::Builder::QueryMemory(bytes, size); //now write `bytes` to a packet and send, completing the transaction
+	delete[] bytes;
+	bytes = nullptr;
+	return SendData(outBytes);
+}
+
+/*
+	MakeHeartbeat - Generates a response to server heartbeat requests
+	returns a char* array containing the auth cookie. Very simple example, non-public versions of the project use something more complicated
+*/
+__forceinline const char* NetClient::MakeHeartbeat(__in const std::string cookie)
+{
+	if (!Process::IsReturnAddressInModule(*(UINT64*)_AddressOfReturnAddress(), NULL)) //return address check, NULL refers to the current module
+	{
+		Logger::logf(Detection, "Return address was outside of module @ NetClient::MakeHeartbeat : some attacker might be trying to spoof heartbeats");
+		return nullptr;
+	}
+
+	byte* b = (byte*)cookie.c_str();
+
+	byte Transformer = 0x18; //the heartbeat response is the request xor'd with Transformer, transformer is added to by each value of the request
+
+	char* HeartbeatResponse = new char[128] {0};
+
+	for (int i = 0; i < 128; i++)
+	{
+		byte val = (byte)((byte)b[i]);
+		val ^= Transformer;
+		HeartbeatResponse[i] = val;
+	}
+
+	return HeartbeatResponse;
+}
+
+/*
+	EncryptData - encrypts `buffer` using xor /w sub/add operation
+	Of course a much better encryption routine can be replaced with this, everyone will have their own preference (AES, RSA, Salsa, etc) so you can implement one yourself if desired
+*/
+void __forceinline NetClient::CipherData(__inout LPBYTE buffer, __in const int length)
+{
+	const byte XorKey = 0x90;
+	const byte OperationKey = 0x14;
+
+	for (int i = 0; i < length; i++)
+	{
+		if(i % 2 == 0)
+			buffer[i] = (buffer[i] ^ XorKey) + OperationKey;
+		else
+			buffer[i] = (buffer[i] ^ XorKey) - OperationKey;
+	}
+}
+
+/*
 	GetMACAddress - Generates MAC address of the network adapter
 	returns empty string on failure
 */
@@ -268,40 +441,42 @@ string NetClient::GetMACAddress()
 {
 	PIP_ADAPTER_INFO AdapterInfo;
 	DWORD dwBufLen = sizeof(IP_ADAPTER_INFO);
-	char* mac_addr = (char*)malloc(sizeof(char)*255);
+	char* mac_addr = new char[255];
 
 	AdapterInfo = (IP_ADAPTER_INFO*)malloc(sizeof(IP_ADAPTER_INFO));
 	if (AdapterInfo == NULL)
 	{
-		Logger::logf("UltimateAnticheat.log", Err, "Error allocating memory needed to call GetAdaptersinfo @ GetMACAddress");
-		free(mac_addr);
+		Logger::logf(Err, "Error allocating memory needed to call GetAdaptersinfo @ GetMACAddress");
+		delete[] mac_addr;
 		return "";
 	}
 
-	if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == ERROR_BUFFER_OVERFLOW) 
+	if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == ERROR_BUFFER_OVERFLOW)
 	{
 		free(AdapterInfo);
 		AdapterInfo = (IP_ADAPTER_INFO*)malloc(dwBufLen);
-		if (AdapterInfo == NULL) 
+		if (AdapterInfo == NULL)
 		{
-			Logger::logf("UltimateAnticheat.log", Err, "Error allocating memory needed to call GetAdaptersinfo @ GetMACAddress");
-			free(mac_addr);
+			Logger::logf(Err, "Error allocating memory needed to call GetAdaptersinfo @ GetMACAddress");
+			delete[] mac_addr;
 			return "";
 		}
 	}
 
-	if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == NO_ERROR) 
+	if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == NO_ERROR)
 	{
-
 		PIP_ADAPTER_INFO pAdapterInfo = AdapterInfo;
-		do 
+		do
 		{
-			if(mac_addr != nullptr)
+			if (mac_addr != nullptr)
 				sprintf(mac_addr, "%02X:%02X:%02X:%02X:%02X:%02X", pAdapterInfo->Address[0], pAdapterInfo->Address[1], pAdapterInfo->Address[2], pAdapterInfo->Address[3], pAdapterInfo->Address[4], pAdapterInfo->Address[5]); pAdapterInfo = pAdapterInfo->Next;
 		} while (pAdapterInfo);
 	}
+
 	free(AdapterInfo);
-	return mac_addr; // caller must free!
+	string s_mac_addr = mac_addr;
+	delete[] mac_addr;
+	return s_mac_addr;
 }
 
 /*
@@ -309,7 +484,7 @@ string NetClient::GetMACAddress()
 */
 string NetClient::GetHardwareID()
 {
-	std::string HWID = "";
+	string HWID = "";
 
 	CHAR volumeName[MAX_PATH + 1] = { 0 };
 	CHAR fileSystemName[MAX_PATH + 1] = { 0 };
@@ -333,175 +508,21 @@ string NetClient::GetHardwareID()
 		}
 	}
 
-	if (GetVolumeInformationA(firstDrive, volumeName, ARRAYSIZE(volumeName),&serialNumber,&maxComponentLen,&fileSystemFlags,fileSystemName,ARRAYSIZE(fileSystemName)))
+	if (GetVolumeInformationA(firstDrive, volumeName, ARRAYSIZE(volumeName), &serialNumber, &maxComponentLen, &fileSystemFlags, fileSystemName, ARRAYSIZE(fileSystemName)))
 	{
 		CHAR serialBuf[20];
 		_itoa(serialNumber, serialBuf, 10);
 
-		CHAR username[1024 + 1];
-		DWORD size = 1024 + 1;
-		GetUserNameA((CHAR*)username, &size);
+		CHAR username[128];
+		DWORD size = sizeof(username);
+		GetUserNameA(username, &size);
 
 		HWID = username;
 		HWID += "-";
 		HWID += serialBuf;
 	}
-	else 
+	else
 		HWID = "Failed to generate HWID.";
-	
+
 	return HWID;
-}
-
-/*
-	HandleInboundPacket - read packet `p`  and take action based on its opcode
-*/
-Error NetClient::HandleInboundPacket(PacketReader* p)
-{
-	if (p == nullptr)
-		return Error::NULL_MEMORY_REFERENCE;
-
-	Error err = Error::OK;
-
-	uint16_t opcode = p->readShort();
-
-	switch (opcode) //parse server-to-client packets
-	{
-		case Packets::Opcodes::SC_HELLO: //AC initialization can possibly be put into this handler. server is confirming game license code was fine
-		{
-			uint16_t softwareVersion = p->readShort();
-			HandshakeCompleted = true;
-			Logger::logf("UltimateAnticheat.log", Info, "Got reply from server with version: %d", softwareVersion);
-		}break;
-
-		case Packets::Opcodes::SC_HEARTBEAT: //auth cookie every few minutes
-		{
-			short cookie_len = p->readShort();
-
-			if (cookie_len != 128)
-				return Error::INCOMPLETE_RECV;
-
-			string cookie = p->readString(128);
-
-			const char* ResponseCookie = MakeHeartbeat(cookie);
-
-			if (ResponseCookie != NULL)
-			{
-				PacketWriter* Response = Packets::Builder::Heartbeat(ResponseCookie);
-
-				if (SendData(Response) != Error::OK)
-				{
-					Logger::logf("UltimateAnticheat.log", Err, "Could not send heartbeat @ HandleInboundPacket");
-					err = Error::BAD_HEARTBEAT;
-				}
-
-				delete[] ResponseCookie;
-				ResponseCookie = nullptr; //remove use-after-free possibility
-			}
-			else
-			{
-				Logger::logf("UltimateAnticheat.log", Err, "Failed to generate heartbeat @ HandleInboundPacket");
-				err = Error::BAD_HEARTBEAT;
-			}
-		}break;
-
-		case Packets::Opcodes::SC_QUERY_MEMORY: //server requests byte data @ address
-		{
-			uint64_t address = p->readLong();
-			uint32_t size = p->readInt();
-
-			if (QueryMemory(address, size) != Error::OK)
-			{
-				Logger::logf("UltimateAnticheat.log", Err, "Could not query memory bytes for server auth @ HandleInboundPacket");
-				err = Error::GENERIC_FAIL;
-			}
-		}break;
-
-		default:
-			err = Error::BAD_OPCODE;
-			break;
-	}
-
-	return err;
-}
-
-/*
-	FlagCheater - tells server the client has detected cheating
-	returns Error::OK on success
-*/
-Error NetClient::FlagCheater(DetectionFlags flag)
-{
-	PacketWriter* outBytes = Packets::Builder::DetectedCheater(flag);
-	return SendData(outBytes);
-}
-
-/*
-	QueryMemory - Server requested client to read bytes @ some memory address
-	returns Error::OK on success
-*/
-Error NetClient::QueryMemory(uint64_t address, uint32_t size)
-{
-	if (size == 0 || address == 0)
-	{
-		Logger::logf("UltimateAnticheat.log", Err, "Failed to fetch bytes at memory address (size or address was 0) @ NetClient::QueryMemory");
-		return Error::INCOMPLETE_SEND;
-	}
-
-	BYTE* bytes = Process::GetBytesAtAddress(address, size);
-
-	if (bytes == nullptr)
-	{
-		Logger::logf("UltimateAnticheat.log", Err, "Failed to fetch bytes at memory address @ NetClient::QueryMemory");
-		return Error::NULL_MEMORY_REFERENCE;
-	}
-
-	PacketWriter* outBytes = Packets::Builder::QueryMemory(bytes, size); //now write `bytes` to a packet and send, completing the transaction
-	delete[] bytes;
-	bytes = nullptr;
-	return SendData(outBytes);
-}
-
-/*
-	MakeHeartbeat - Generates a response to server heartbeat requests
-	returns a char* array containing the auth cookie
-*/
-__forceinline const char* NetClient::MakeHeartbeat(string cookie)
-{
-	if (!Process::IsReturnAddressInModule(*(UINT64*)_AddressOfReturnAddress(), NULL)) //return address check
-	{
-		Logger::logf("UltimateAnticheat.log", Detection, "Return address was outside of module @ NetClient::MakeHeartbeat : some attacker might be trying to spoof heartbeats");
-		return nullptr;
-	}
-
-	byte* b = (byte*)cookie.c_str();
-
-	byte Transformer = 0x18; //the heartbeat response is the request xor'd with Transformer, transformer is added to by each value of the request
-							 //once this is confirmed working properly we can try to implement something more complex
-
-	char* HeartbeatResponse = new char[128] {0};
-
-	for (int i = 0; i < 128; i++)
-	{
-		byte val = (byte)((byte)b[i]);
-		val ^= Transformer;
-		HeartbeatResponse[i] = val;
-	}
-
-	return HeartbeatResponse;
-}
-
-/*
-	EncryptData - encrypts `buffer` using xor /w sub/add operation
-*/
-void NetClient::CipherData(LPBYTE buffer, int length)
-{
-	const byte XorKey = 0x90;
-	const byte OperationKey = 0x90;
-
-	for (int i = 0; i < length; i++)
-	{
-		if(i % 2 == 0)
-			buffer[i] = (buffer[i] ^ XorKey) + OperationKey;
-		else
-			buffer[i] = (buffer[i] ^ XorKey) - OperationKey;
-	}
 }
